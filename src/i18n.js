@@ -42,6 +42,7 @@
     'picker.title': 'Choose partial-export range',
     'picker.start': 'Start', 'picker.end': 'End', 'picker.confirm': 'Use this range', 'picker.last': 'Final message',
     'picker.close': 'Close',
+    'picker.refresh': 'Refresh conversation list',
     'picker.loading': 'Loading the complete conversation…',
     'picker.choose': 'Choose a {boundary} message · {count} messages available',
     'picker.failed': 'Unable to load start points: {message}',
@@ -134,8 +135,24 @@
     },
   };
 
+  const REFRESH_LABELS = Object.freeze({
+    'zh-CN': '刷新对话列表',
+    en: 'Refresh conversation list',
+    ja: '会話リストを更新',
+    ko: '대화 목록 새로고침',
+    de: 'Konversationsliste aktualisieren',
+    es: 'Actualizar lista de conversación',
+    fr: 'Actualiser la liste de conversation',
+    ru: 'Обновить список диалога',
+    uk: 'Оновити список розмови',
+  });
+
   const MESSAGES = Object.fromEntries(
-    SUPPORTED_LOCALES.map((locale) => [locale, { ...EN, ...(OVERRIDES[locale] || {}) }]),
+    SUPPORTED_LOCALES.map((locale) => [locale, {
+      ...EN,
+      ...(OVERRIDES[locale] || {}),
+      'picker.refresh': REFRESH_LABELS[locale] || EN['picker.refresh'],
+    }]),
   );
 
   /** Normalize browser/persisted locale values to one supported extension locale. */

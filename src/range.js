@@ -23,6 +23,18 @@
     });
   }
 
+  /** Preserve valid picker boundaries after a fresh read and fall back safely when messages disappeared. */
+  function resolvePickerSelection(options, selection = {}) {
+    const source = Array.isArray(options) ? options.filter(Boolean) : [];
+    if (!source.length) return { startOption: null, endOption: null };
+
+    const byKey = new Map(source.map((option) => [option.key, option]));
+    const startOption = byKey.get(selection?.startMessageKey) || source[0];
+    let endOption = byKey.get(selection?.endMessageKey) || source.at(-1);
+    if (endOption.messagePosition < startOption.messagePosition) endOption = source.at(-1);
+    return { startOption, endOption };
+  }
+
   /** Backward-compatible User-only selector used by older callers. */
   function getUserStartOptions(messages, previewLength = 96) {
     let userOrdinal = 0;
@@ -87,5 +99,5 @@
     };
   }
 
-  ns.range = { getMessageOptions, getUserStartOptions, applyExportRange };
+  ns.range = { getMessageOptions, resolvePickerSelection, getUserStartOptions, applyExportRange };
 })();

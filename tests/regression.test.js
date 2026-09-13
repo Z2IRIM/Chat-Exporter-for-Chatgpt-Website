@@ -661,7 +661,7 @@ test('large raster compression downsizes the longest edge, emits WebP, and keeps
 
 test('V1.5 UI keeps the persisted conversation-image option and packages image assets for Markdown/ZIP', () => {
   const manifest = JSON.parse(fs.readFileSync(path.join(ROOT, 'manifest.json'), 'utf8'));
-  assert.equal(manifest.version, '1.5.0');
+  assert.equal(manifest.version, '1.5.1');
 
   const content = fs.readFileSync(path.join(ROOT, 'src/content.js'), 'utf8');
   assert.match(content, /includeImages/);
@@ -777,9 +777,9 @@ test('print renderer creates a self-contained printable document with embedded i
   assert.doesNotMatch(html, /chatgpt-file:\/\//);
 });
 
-test('V1.5 PDF export requires an explicit pre-print confirmation and keeps version 1.5.0', () => {
+test('V1.5.1 PDF export keeps explicit pre-print confirmation', () => {
   const manifest = JSON.parse(fs.readFileSync(path.join(ROOT, 'manifest.json'), 'utf8'));
-  assert.equal(manifest.version, '1.5.0');
+  assert.equal(manifest.version, '1.5.1');
   const scripts = manifest.content_scripts?.[0]?.js || [];
   assert.ok(scripts.includes('src/print.js'));
   assert.ok(scripts.indexOf('src/print.js') < scripts.indexOf('src/content.js'));
@@ -962,4 +962,56 @@ test('partial-range message list uses wider spacing, left-aligned text, and no t
   assert.doesNotMatch(content, /\.start-item\.is-end\s*\{[^}]*border-right:\s*3px/s);
   assert.match(content, /\.start-item\.is-start\s*\{[^}]*border-color:/s);
   assert.match(content, /\.start-item\.is-end\s*\{[^}]*border-color:/s);
+});
+
+
+test('V1.5.1 refresh reconciliation preserves valid boundaries and falls back when refreshed messages disappear', () => {
+  const ns = loadNamespaceScript('src/range.js');
+  assert.equal(typeof ns.range?.resolvePickerSelection, 'function', 'range.resolvePickerSelection must exist');
+  const options = ns.range.getMessageOptions([
+    { key: 'u1', role: 'user', text: 'Q1' },
+    { key: 'a1', role: 'assistant', text: 'A1' },
+    { key: 'u2', role: 'user', text: 'Q2' },
+    { key: 'a2', role: 'assistant', text: 'A2' },
+  ]);
+
+  const preserved = ns.range.resolvePickerSelection(options, {
+    startMessageKey: 'a1',
+    endMessageKey: 'u2',
+  });
+  assert.equal(preserved.startOption.key, 'a1');
+  assert.equal(preserved.endOption.key, 'u2');
+
+  const missing = ns.range.resolvePickerSelection(options, {
+    startMessageKey: 'removed-start',
+    endMessageKey: 'removed-end',
+  });
+  assert.equal(missing.startOption.key, 'u1');
+  assert.equal(missing.endOption.key, 'a2');
+
+  const invalidOrder = ns.range.resolvePickerSelection(options, {
+    startMessageKey: 'u2',
+    endMessageKey: 'a1',
+  });
+  assert.equal(invalidOrder.startOption.key, 'u2');
+  assert.equal(invalidOrder.endOption.key, 'a2');
+});
+
+test('V1.5.1 partial-range picker exposes refresh UI and refresh forces a fresh conversation read', () => {
+  const content = fs.readFileSync(path.join(ROOT, 'src/content.js'), 'utf8');
+  assert.match(content, /class="picker-refresh"/);
+  assert.match(content, /openPartialPicker\(\{\s*forceRefresh\s*=\s*false,\s*selection\s*=\s*null\s*\}\s*=\s*\{\}\)/s);
+  assert.match(content, /if\s*\(forceRefresh\)\s*partialScanCache\s*=\s*null/);
+  assert.match(content, /openPartialPicker\(\{\s*forceRefresh:\s*true,\s*selection:/s);
+  assert.match(content, /pickerRefresh\.disabled\s*=\s*true/);
+  assert.match(content, /pickerConfirm\.disabled\s*=\s*true/);
+});
+
+test('V1.5.1 refresh control is localized across every supported UI locale', () => {
+  const ns = loadNamespaceScript('src/i18n.js');
+  for (const locale of ns.i18n.SUPPORTED_LOCALES) {
+    const refresh = ns.i18n.t(locale, 'picker.refresh');
+    assert.notEqual(refresh, 'picker.refresh');
+    assert.ok(refresh.trim().length > 0);
+  }
 });

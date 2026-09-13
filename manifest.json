@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "ChatGPT Conversation Exporter",
-  "version": "1.5.0",
+  "version": "1.5.1",
   "description": "一键导出当前 ChatGPT 对话，支持全量/部分导出、Markdown 图片资源包、PDF 打印导出、工具调用详情开关与多语言界面。",
   "permissions": [
     "activeTab",

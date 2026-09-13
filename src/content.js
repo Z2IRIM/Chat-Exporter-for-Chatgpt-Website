@@ -27,6 +27,7 @@
   let exportSettings = ns.exportOptions?.normalize?.() || { includeToolDetails: false, includeImages: true };
   let currentLocale = ns.i18n?.DEFAULT_LOCALE || 'zh-CN';
   let partialScanCache = null;
+  let partialPickerLoading = false;
 
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -1148,7 +1149,14 @@
    * Render loading placeholders so partial-range scanning never appears frozen.
    */
   function renderPickerLoadingState(current, statusText) {
+    const pickerRefresh = current.pickerRefresh;
+    const pickerConfirm = current.pickerConfirm;
+    pickerRefresh.disabled = true;
+    pickerConfirm.disabled = true;
+    current.pickerStart.disabled = true;
+    current.pickerEnd.disabled = true;
     current.pickerPanel?.classList.add('loading');
+    current.pickerRefresh?.classList.add('loading');
     current.pickerSpinner?.removeAttribute('hidden');
     current.pickerStatus.textContent = statusText || tr('picker.loading');
     current.pickerList.replaceChildren();
@@ -1166,16 +1174,36 @@
    */
   function clearPickerLoadingState(current) {
     current.pickerPanel?.classList.remove('loading');
+    current.pickerRefresh?.classList.remove('loading');
     current.pickerSpinner?.setAttribute('hidden', 'hidden');
+    current.pickerRefresh.disabled = false;
+    current.pickerConfirm.disabled = false;
+    current.pickerStart.disabled = false;
+    current.pickerEnd.disabled = false;
+  }
+
+  /** Leave refresh available after a failed read while preventing stale range confirmation. */
+  function renderPickerLoadErrorState(current) {
+    current.pickerPanel?.classList.remove('loading');
+    current.pickerRefresh?.classList.remove('loading');
+    current.pickerSpinner?.setAttribute('hidden', 'hidden');
+    current.pickerRefresh.disabled = false;
+    current.pickerConfirm.disabled = true;
+    current.pickerStart.disabled = true;
+    current.pickerEnd.disabled = true;
   }
 
   /**
    * Load the complete branch and let the user choose a User message as the partial-export start point.
    */
-  async function openPartialPicker() {
+  async function openPartialPicker({ forceRefresh = false, selection = null } = {}) {
     const current = ensureUi();
     current.menu.classList.remove('open');
     current.pickerBackdrop.classList.add('open');
+    if (partialPickerLoading) return;
+
+    partialPickerLoading = true;
+    if (forceRefresh) partialScanCache = null;
     renderPickerLoadingState(current, tr('picker.loading'));
 
     try {
@@ -1187,14 +1215,13 @@
         partialScanCache = { url: location.href, includeToolDetails: exportSettings.includeToolDetails, scanInfo };
       }
 
-      if (!ns.range?.getMessageOptions) throw new Error(tr('error.rangeModule'));
+      if (!ns.range?.getMessageOptions || !ns.range?.resolvePickerSelection) throw new Error(tr('error.rangeModule'));
       const options = ns.range.getMessageOptions(scanInfo.messages);
       if (!options.length) throw new Error(tr('error.noMessages'));
 
-      const byKey = new Map(options.map((option) => [option.key, option]));
-      let startOption = byKey.get(exportRangeSelection.startMessageKey) || options[0];
-      let endOption = byKey.get(exportRangeSelection.endMessageKey) || options.at(-1);
-      if (endOption.messagePosition < startOption.messagePosition) endOption = options.at(-1);
+      const restored = ns.range.resolvePickerSelection(options, selection || exportRangeSelection);
+      let startOption = restored.startOption;
+      let endOption = restored.endOption;
       let boundary = 'start';
 
       const render = () => {
@@ -1264,6 +1291,12 @@
 
       current.pickerStart.onclick = () => { boundary = 'start'; render(); };
       current.pickerEnd.onclick = () => { boundary = 'end'; render(); };
+      current.pickerRefresh.onclick = () => {
+        openPartialPicker({ forceRefresh: true, selection: {
+          startMessageKey: startOption.key,
+          endMessageKey: endOption.key,
+        } });
+      };
       current.pickerConfirm.onclick = () => {
         setExportRangeSelection({
           mode: 'partial',
@@ -1275,12 +1308,15 @@
         });
         closePartialPicker({ reopenMenu: true });
       };
+      partialPickerLoading = false;
       render();
     } catch (error) {
-      clearPickerLoadingState(current);
+      partialPickerLoading = false;
+      renderPickerLoadErrorState(current);
       current.pickerList.replaceChildren();
       const message = error instanceof Error ? error.message : String(error);
       current.pickerStatus.textContent = tr('picker.failed', { message });
+      current.pickerRefresh.onclick = () => openPartialPicker({ forceRefresh: true, selection });
     }
   }
 
@@ -1308,6 +1344,8 @@
     ui.pickerStart.textContent = tr('picker.start');
     ui.pickerEnd.textContent = tr('picker.end');
     ui.pickerConfirm.textContent = tr('picker.confirm');
+    ui.pickerRefresh.setAttribute('aria-label', tr('picker.refresh'));
+    ui.pickerRefresh.setAttribute('title', tr('picker.refresh'));
     ui.pickerClose.setAttribute('aria-label', tr('picker.close'));
     ui.pickerBackdrop.querySelector('.picker')?.setAttribute('aria-label', tr('picker.title'));
     updateLanguagePickerUi();
@@ -1429,8 +1467,14 @@
         .picker { width: min(760px, calc(100vw - 32px)); max-height: min(80vh, 800px); display: grid; grid-template-rows: auto auto auto minmax(0, 1fr) auto; overflow: hidden; border-radius: 16px; border: 1px solid rgba(127,127,127,.28); background: rgba(28,28,28,.985); color: #fff; box-shadow: 0 24px 80px rgba(0,0,0,.42); }
         .picker-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 16px 9px; }
         .picker-title { font-size: 14px; font-weight: 720; }
-        .picker-close { all: unset; cursor: pointer; width: 28px; height: 28px; display: grid; place-items: center; border-radius: 8px; color: rgba(255,255,255,.68); font-size: 18px; }
-        .picker-close:hover { background: rgba(255,255,255,.08); color: #fff; }
+        .picker-header-actions { display: flex; align-items: center; gap: 4px; }
+        .picker-refresh, .picker-close { all: unset; cursor: pointer; width: 28px; height: 28px; display: grid; place-items: center; border-radius: 8px; color: rgba(255,255,255,.68); }
+        .picker-refresh { font-size: 17px; }
+        .picker-close { font-size: 18px; }
+        .picker-refresh:hover, .picker-close:hover { background: rgba(255,255,255,.08); color: #fff; }
+        .picker-refresh:disabled { opacity: .45; cursor: progress; }
+        .picker-refresh-icon { display: inline-block; line-height: 1; }
+        .picker-refresh.loading .picker-refresh-icon { animation: cgpt-export-spin .8s linear infinite; }
         .picker-status-row { display:flex; align-items:center; gap:10px; min-height: 18px; padding: 0 16px 10px; }
         .picker-status { color: rgba(255,255,255,.58); font-size: 11px; min-width: 0; }
         .picker-spinner { width: 14px; height: 14px; border-radius: 999px; border: 2px solid rgba(255,255,255,.18); border-top-color: rgba(255,255,255,.88); animation: cgpt-export-spin .8s linear infinite; flex: 0 0 auto; }
@@ -1457,6 +1501,7 @@
         .picker-boundary.active { background:rgba(255,255,255,.12); border-color:rgba(255,255,255,.28); color:#fff; }
         .picker-actions { display:flex; justify-content:flex-end; padding:10px 16px 14px; border-top:1px solid rgba(255,255,255,.08); }
         .picker-confirm { all:unset; cursor:pointer; border-radius:9px; padding:8px 13px; background:#fff; color:#111; font-size:12px; font-weight:700; }
+        .picker-confirm:disabled { opacity:.42; cursor:progress; }
         @keyframes cgpt-export-spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
         @keyframes cgpt-export-panel-shimmer { 0% { transform: translateX(-55%); } 100% { transform: translateX(55%); } }
         .progress { display: none; position: absolute; right: 0; bottom: -34px; width: max-content; max-width: 320px; color: rgba(255,255,255,.86); background: rgba(28,28,28,.92); border: 1px solid rgba(127,127,127,.22); border-radius: 8px; padding: 6px 9px; font-size: 11px; box-shadow: 0 7px 20px rgba(0,0,0,.18); }
@@ -1523,7 +1568,10 @@
         <div class="picker" role="dialog" aria-modal="true" aria-label="选择部分导出起始点">
           <div class="picker-header">
             <div class="picker-title">选择部分导出的起始消息</div>
-            <button class="picker-close" type="button" aria-label="关闭">×</button>
+            <div class="picker-header-actions">
+              <button class="picker-refresh" type="button" aria-label="刷新对话列表" title="刷新对话列表"><span class="picker-refresh-icon" aria-hidden="true">↻</span></button>
+              <button class="picker-close" type="button" aria-label="关闭">×</button>
+            </div>
           </div>
           <div class="picker-status-row"><div class="picker-spinner" aria-hidden="true" hidden></div><div class="picker-status">正在读取完整对话…</div></div>
           <div class="picker-boundaries"><button class="picker-boundary picker-start" type="button">起始点</button><button class="picker-boundary picker-end" type="button">截止点</button></div>
@@ -1545,6 +1593,7 @@
     const pickerSpinner = shadow.querySelector('.picker-spinner');
     const pickerStatus = shadow.querySelector('.picker-status');
     const pickerList = shadow.querySelector('.picker-list');
+    const pickerRefresh = shadow.querySelector('.picker-refresh');
     const pickerClose = shadow.querySelector('.picker-close');
     const rangeTitle = shadow.querySelector('.range-title');
     const optionsTitle = shadow.querySelector('.options-title');
@@ -1677,7 +1726,7 @@
 
     ui = {
       host, shadow, button, menu, progress, toast, toastTimer: null,
-      rangeButtons, rangeSummary, pickerBackdrop, pickerPanel, pickerSpinner, pickerStatus, pickerList, pickerClose,
+      rangeButtons, rangeSummary, pickerBackdrop, pickerPanel, pickerSpinner, pickerStatus, pickerList, pickerRefresh, pickerClose,
       rangeTitle, optionsTitle, toolDetailsInput, toolDetailsLabel, toolDetailsHint,
       imagesInput, imagesLabel, imagesHint, languageTitle, languagePicker, languageTrigger, languageCurrent, languageList, languageOptions, menuHint, formatZip, formatMd, formatPdf, formatJson, pickerTitle, pickerStart, pickerEnd, pickerConfirm,
     };
