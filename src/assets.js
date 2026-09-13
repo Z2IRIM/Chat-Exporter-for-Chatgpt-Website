@@ -26,6 +26,19 @@
     ['svg', 'image/svg+xml'],
   ]);
 
+  const COMPRESSIBLE_MIME_TYPES = new Set([
+    'image/png',
+    'image/jpeg',
+    'image/jpg',
+    'image/webp',
+    'image/avif',
+    'image/bmp',
+  ]);
+
+  const DEFAULT_COMPRESSION_THRESHOLD_BYTES = 1024 * 1024;
+  const DEFAULT_COMPRESSION_MAX_EDGE = 2048;
+  const DEFAULT_COMPRESSION_QUALITY = 0.85;
+
   /**
    * Return a normalized supported image MIME type, or null for generic/non-image values.
    */
@@ -100,7 +113,6 @@
     return { mimeType: 'application/octet-stream', extension: 'bin', source: 'fallback' };
   }
 
-
   /**
    * Build optional Authorization headers for protected ChatGPT asset downloads.
    */
@@ -110,6 +122,7 @@
 
   /**
    * Build a deterministic ZIP path for one archived conversation image.
+   * Retained for backwards compatibility with older exports/tests.
    */
   function createImageAssetPath(messagePosition, imagePosition, mimeType, explicitExtension = null) {
     const extension = explicitExtension || MIME_EXTENSION.get(String(mimeType || '').toLowerCase()) || 'bin';
@@ -118,6 +131,7 @@
 
   /**
    * Replace remote image sources in Markdown with archived relative ZIP paths.
+   * Retained for backwards compatibility with older exports/tests.
    */
   function rewriteMarkdownImageSources(markdown, images) {
     let output = String(markdown || '');
@@ -144,6 +158,152 @@
     return [output, additions.join('\n\n')].filter(Boolean).join('\n\n');
   }
 
+  /**
+   * Return a stable key used to deduplicate the same image across messages and tool output nodes.
+   */
+  function getImageSourceKey(image) {
+    return image?.fileId ? `file:${image.fileId}` : String(image?.fetchSrc || image?.src || '');
+  }
+
+  /**
+   * Encode image bytes as a self-contained data URI suitable for Markdown/HTML renderers.
+   */
+  function bytesToDataUri(bytes, mimeType) {
+    const value = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes || []);
+    let binary = '';
+    const chunkSize = 0x8000;
+    for (let offset = 0; offset < value.length; offset += chunkSize) {
+      binary += String.fromCharCode(...value.subarray(offset, offset + chunkSize));
+    }
+    return `data:${normalizeImageMime(mimeType) || 'application/octet-stream'};base64,${btoa(binary)}`;
+  }
+
+  /**
+   * Decide whether an image is large enough and safe enough to recompress without losing animation/vector semantics.
+   */
+  function shouldCompressImage({ byteLength = 0, mimeType } = {}, thresholdBytes = DEFAULT_COMPRESSION_THRESHOLD_BYTES) {
+    const normalized = normalizeImageMime(mimeType);
+    return Number(byteLength) > thresholdBytes && COMPRESSIBLE_MIME_TYPES.has(normalized);
+  }
+
+  /**
+   * Calculate a contained output size without enlarging the source image.
+   */
+  function calculateContainSize(width, height, maxEdge = DEFAULT_COMPRESSION_MAX_EDGE) {
+    const safeWidth = Math.max(1, Number(width) || 1);
+    const safeHeight = Math.max(1, Number(height) || 1);
+    const longest = Math.max(safeWidth, safeHeight);
+    const scale = longest > maxEdge ? maxEdge / longest : 1;
+    return {
+      width: Math.max(1, Math.round(safeWidth * scale)),
+      height: Math.max(1, Math.round(safeHeight * scale)),
+    };
+  }
+
+  /**
+   * Recompress a large raster image to WebP when browser image APIs are available and the result is actually smaller.
+   */
+  async function compressImageForEmbedding(asset, options = {}) {
+    const sourceBytes = asset?.bytes instanceof Uint8Array ? asset.bytes : new Uint8Array(asset?.bytes || []);
+    const sourceMimeType = normalizeImageMime(asset?.mimeType) || asset?.mimeType || 'application/octet-stream';
+    const thresholdBytes = options.thresholdBytes ?? DEFAULT_COMPRESSION_THRESHOLD_BYTES;
+    const maxEdge = options.maxEdge ?? DEFAULT_COMPRESSION_MAX_EDGE;
+    const quality = options.quality ?? DEFAULT_COMPRESSION_QUALITY;
+
+    if (!shouldCompressImage({ byteLength: sourceBytes.length, mimeType: sourceMimeType }, thresholdBytes)) {
+      return { bytes: sourceBytes, mimeType: sourceMimeType, compressed: false };
+    }
+
+    const createBitmap = options.createImageBitmap || globalThis.createImageBitmap;
+    const createCanvas = options.createCanvas || ((width, height) => {
+      if (!globalThis.document?.createElement) return null;
+      const canvas = globalThis.document.createElement('canvas');
+      canvas.width = width;
+      canvas.height = height;
+      return canvas;
+    });
+    if (typeof createBitmap !== 'function' || typeof createCanvas !== 'function') {
+      return { bytes: sourceBytes, mimeType: sourceMimeType, compressed: false };
+    }
+
+    let bitmap = null;
+    try {
+      bitmap = await createBitmap(new Blob([sourceBytes], { type: sourceMimeType }));
+      const size = calculateContainSize(bitmap.width, bitmap.height, maxEdge);
+      const canvas = createCanvas(size.width, size.height);
+      const context = canvas?.getContext?.('2d');
+      if (!canvas || !context) return { bytes: sourceBytes, mimeType: sourceMimeType, compressed: false };
+      if ('width' in canvas) canvas.width = size.width;
+      if ('height' in canvas) canvas.height = size.height;
+      context.drawImage(bitmap, 0, 0, size.width, size.height);
+
+      let outputBlob = null;
+      if (typeof canvas.convertToBlob === 'function') {
+        outputBlob = await canvas.convertToBlob({ type: 'image/webp', quality });
+      } else if (typeof canvas.toBlob === 'function') {
+        outputBlob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/webp', quality));
+      }
+      if (!outputBlob) return { bytes: sourceBytes, mimeType: sourceMimeType, compressed: false };
+
+      const outputBytes = new Uint8Array(await outputBlob.arrayBuffer());
+      if (!outputBytes.length || outputBytes.length >= sourceBytes.length) {
+        return { bytes: sourceBytes, mimeType: sourceMimeType, compressed: false };
+      }
+      return {
+        bytes: outputBytes,
+        mimeType: normalizeImageMime(outputBlob.type) || 'image/webp',
+        compressed: true,
+      };
+    } catch {
+      return { bytes: sourceBytes, mimeType: sourceMimeType, compressed: false };
+    } finally {
+      bitmap?.close?.();
+    }
+  }
+
+  /**
+   * Render message Markdown with embedded image data URIs, or remove image references when image export is disabled/failed.
+   */
+  function renderMarkdownImages(markdown, images, embeddedBySource = new Map(), includeImages = true) {
+    let output = String(markdown || '');
+    const replacements = typeof embeddedBySource?.get === 'function' ? embeddedBySource : new Map(Object.entries(embeddedBySource || {}));
+
+    const removeKnownReference = (source) => {
+      if (!source) return;
+      const escaped = String(source).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      output = output.replace(new RegExp(`!\\[[^\\]]*\\]\\(${escaped}(?:\\s+"[^"]*")?\\)`, 'g'), '');
+      output = output.replace(new RegExp(`<img\\b[^>]*\\bsrc=["']${escaped}["'][^>]*>`, 'gi'), '');
+    };
+
+    const additions = [];
+    for (const image of images || []) {
+      const source = image?.src || image?.fetchSrc || null;
+      const key = getImageSourceKey(image);
+      const embedded = includeImages ? replacements.get(key) : null;
+      if (embedded && source) {
+        output = output.split(source).join(embedded);
+      } else if (source) {
+        removeKnownReference(source);
+      }
+
+      if (embedded && !output.includes(embedded)) {
+        const alt = String(image?.alt || image?.originalName || 'image').replace(/\]/g, '\\]');
+        additions.push(`![${alt}](${embedded})`);
+      }
+    }
+
+    if (includeImages && additions.length) {
+      output = [output.trim(), additions.join('\n\n')].filter(Boolean).join('\n\n');
+    }
+
+    output = output.replace(/!\[[^\]]*\]\(chatgpt-file:\/\/[^)]+\)/g, '');
+
+    return output
+      .replace(/[ \t]+\n/g, '\n')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+  }
+
   ns.assets = {
     createImageAssetPath,
     rewriteMarkdownImageSources,
@@ -151,5 +311,11 @@
     resolveImageType,
     imageTypeFromMagic,
     createAssetRequestHeaders,
+    getImageSourceKey,
+    bytesToDataUri,
+    shouldCompressImage,
+    calculateContainSize,
+    compressImageForEmbedding,
+    renderMarkdownImages,
   };
 })();

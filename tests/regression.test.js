@@ -296,17 +296,15 @@ test('partial export includes the selected user message and every following mess
   assert.equal(result.metadata.exportedMessageCount, 4);
 });
 
-test('partial export rejects an assistant message as a start point and full export preserves all messages', () => {
+test('partial export may start on an assistant message and full export preserves all messages', () => {
   const ns = loadNamespaceScript('src/range.js');
   const messages = [
     { key: 'u1', role: 'user', text: 'Q1' },
     { key: 'a1', role: 'assistant', text: 'A1' },
   ];
 
-  assert.throws(
-    () => ns.range.applyExportRange(messages, { mode: 'partial', startMessageKey: 'a1' }),
-    /User/,
-  );
+  const partial = ns.range.applyExportRange(messages, { mode: 'partial', startMessageKey: 'a1' });
+  assert.deepEqual(partial.messages.map((message) => message.key), ['a1']);
 
   const full = ns.range.applyExportRange(messages, { mode: 'full' });
   assert.deepEqual(full.messages.map((message) => message.key), ['u1', 'a1']);
@@ -503,8 +501,10 @@ test('export option and locale preferences persist through chrome.storage.local'
   };
 
   const optionsNs = loadNamespaceScript('src/export-options.js', { chrome });
-  await optionsNs.exportOptions.save({ includeToolDetails: true });
-  assert.equal((await optionsNs.exportOptions.load()).includeToolDetails, true);
+  await optionsNs.exportOptions.save({ includeToolDetails: true, includeImages: false });
+  const loadedOptions = await optionsNs.exportOptions.load();
+  assert.equal(loadedOptions.includeToolDetails, true);
+  assert.equal(loadedOptions.includeImages, false);
 
   const i18nNs = loadNamespaceScript('src/i18n.js', { chrome });
   await i18nNs.i18n.saveLocale('en-US');
@@ -536,4 +536,430 @@ test('background asset bridge forwards the short-lived access token as Authoriza
   const background = fs.readFileSync(path.join(ROOT, 'src/background.js'), 'utf8');
   assert.match(background, /fetchAsset\(message\.url,\s*message\.accessToken/);
   assert.match(background, /Authorization:\s*`Bearer \$\{accessToken\}`/);
+});
+
+test('V1.5 export options default to including conversation images and persist an explicit disable', () => {
+  const ns = loadNamespaceScript('src/export-options.js');
+  const defaults = ns.exportOptions.normalize();
+  assert.equal(defaults.includeToolDetails, false);
+  assert.equal(defaults.includeImages, true);
+
+  const disabled = ns.exportOptions.normalize({ includeToolDetails: true, includeImages: false });
+  assert.equal(disabled.includeToolDetails, true);
+  assert.equal(disabled.includeImages, false);
+});
+
+test('image bytes can be converted to a self-contained data URI without external files', () => {
+  const ns = loadNamespaceScript('src/assets.js', {
+    btoa(value) { return Buffer.from(value, 'binary').toString('base64'); },
+  });
+  assert.equal(typeof ns.assets?.bytesToDataUri, 'function', 'assets.bytesToDataUri must exist');
+  const dataUri = ns.assets.bytesToDataUri(new Uint8Array([0x89, 0x50, 0x4e, 0x47]), 'image/png');
+  assert.equal(dataUri, 'data:image/png;base64,iVBORw==');
+});
+
+test('Markdown image rendering embeds downloaded images and removes unresolved placeholders', () => {
+  const ns = loadNamespaceScript('src/assets.js');
+  assert.equal(typeof ns.assets?.renderMarkdownImages, 'function', 'assets.renderMarkdownImages must exist');
+
+  const images = [
+    { fileId: 'file_ok', src: 'chatgpt-file://file_ok', alt: 'ok image' },
+    { fileId: 'file_missing', src: 'chatgpt-file://file_missing', alt: 'missing image' },
+  ];
+  const markdown = [
+    'Before',
+    '',
+    '![ok image](chatgpt-file://file_ok)',
+    '',
+    '![missing image](chatgpt-file://file_missing)',
+    '',
+    'After',
+  ].join('\n');
+  const embedded = new Map([['file:file_ok', 'data:image/png;base64,AAAA']]);
+
+  const rendered = ns.assets.renderMarkdownImages(markdown, images, embedded, true);
+  assert.match(rendered, /data:image\/png;base64,AAAA/);
+  assert.doesNotMatch(rendered, /chatgpt-file:\/\//);
+  assert.match(rendered, /Before/);
+  assert.match(rendered, /After/);
+});
+
+test('disabling conversation images removes image references instead of leaving broken chatgpt-file URLs', () => {
+  const ns = loadNamespaceScript('src/assets.js');
+  const markdown = 'Before\n\n![image](chatgpt-file://file_1)\n\nAfter';
+  const rendered = ns.assets.renderMarkdownImages(
+    markdown,
+    [{ fileId: 'file_1', src: 'chatgpt-file://file_1', alt: 'image' }],
+    new Map(),
+    false,
+  );
+
+  assert.equal(rendered, 'Before\n\nAfter');
+  assert.doesNotMatch(rendered, /chatgpt-file:\/\//);
+});
+
+test('large supported raster images are selected for compression while GIF and SVG stay untouched', () => {
+  const ns = loadNamespaceScript('src/assets.js');
+  assert.equal(typeof ns.assets?.shouldCompressImage, 'function', 'assets.shouldCompressImage must exist');
+  assert.equal(ns.assets.shouldCompressImage({ byteLength: 2 * 1024 * 1024, mimeType: 'image/png' }), true);
+  assert.equal(ns.assets.shouldCompressImage({ byteLength: 900 * 1024, mimeType: 'image/png' }), false);
+  assert.equal(ns.assets.shouldCompressImage({ byteLength: 2 * 1024 * 1024, mimeType: 'image/gif' }), false);
+  assert.equal(ns.assets.shouldCompressImage({ byteLength: 2 * 1024 * 1024, mimeType: 'image/svg+xml' }), false);
+});
+
+test('large raster compression downsizes the longest edge, emits WebP, and keeps the original when compression is not smaller', async () => {
+  const ns = loadNamespaceScript('src/assets.js');
+  assert.equal(typeof ns.assets?.compressImageForEmbedding, 'function', 'assets.compressImageForEmbedding must exist');
+
+  const sourceBytes = new Uint8Array(2048);
+  const calls = { draw: null, quality: null };
+  const bitmap = { width: 4096, height: 1024, close() {} };
+  const compressed = await ns.assets.compressImageForEmbedding(
+    { bytes: sourceBytes, mimeType: 'image/png' },
+    {
+      thresholdBytes: 1024,
+      createImageBitmap: async () => bitmap,
+      createCanvas(width, height) {
+        assert.equal(width, 2048);
+        assert.equal(height, 512);
+        return {
+          getContext() {
+            return { drawImage(...args) { calls.draw = args; } };
+          },
+          toBlob(callback, type, quality) {
+            calls.quality = quality;
+            callback(new Blob([new Uint8Array([1, 2, 3])], { type }));
+          },
+        };
+      },
+    },
+  );
+
+  assert.equal(compressed.compressed, true);
+  assert.equal(compressed.mimeType, 'image/webp');
+  assert.equal(compressed.bytes.length, 3);
+  assert.equal(calls.quality, 0.85);
+  assert.ok(calls.draw);
+
+  const notSmaller = await ns.assets.compressImageForEmbedding(
+    { bytes: new Uint8Array([1, 2]), mimeType: 'image/png' },
+    {
+      thresholdBytes: 1,
+      createImageBitmap: async () => ({ width: 10, height: 10, close() {} }),
+      createCanvas() {
+        return {
+          getContext() { return { drawImage() {} }; },
+          toBlob(callback, type) { callback(new Blob([new Uint8Array([1, 2, 3])], { type })); },
+        };
+      },
+    },
+  );
+  assert.equal(notSmaller.compressed, false);
+  assert.equal(notSmaller.mimeType, 'image/png');
+  assert.equal(notSmaller.bytes.length, 2);
+});
+
+test('V1.5 UI keeps the persisted conversation-image option and packages image assets for Markdown/ZIP', () => {
+  const manifest = JSON.parse(fs.readFileSync(path.join(ROOT, 'manifest.json'), 'utf8'));
+  assert.equal(manifest.version, '1.5.0');
+
+  const content = fs.readFileSync(path.join(ROOT, 'src/content.js'), 'utf8');
+  assert.match(content, /includeImages/);
+  assert.match(content, /images-input/);
+  assert.match(content, /setIncludeImages/);
+  assert.match(content, /\.\.\.imageFiles/);
+  assert.match(content, /createMarkdownImagePackage/);
+
+  const i18n = fs.readFileSync(path.join(ROOT, 'src/i18n.js'), 'utf8');
+  assert.match(i18n, /menu\.images/);
+  assert.match(i18n, /Include conversation images/);
+});
+
+test('V1.5 multilingual UI supports nine locales through a styled custom listbox', () => {
+  const ns = loadNamespaceScript('src/i18n.js');
+  const locales = ['zh-CN', 'en', 'ja', 'ko', 'de', 'es', 'fr', 'ru', 'uk'];
+  const localizedUiKeys = ['menu.full', 'menu.partial', 'menu.hint', 'picker.failed', 'toast.complete', 'toast.printOpened', 'progress.readApi', 'progress.walk', 'menu.pdf'];
+  for (const locale of locales) {
+    assert.equal(ns.i18n.normalizeLocale(locale), locale);
+    for (const key of localizedUiKeys) {
+      assert.notEqual(ns.i18n.t(locale, key), key);
+      if (locale !== 'en' && locale !== 'zh-CN') {
+        assert.notEqual(ns.i18n.t(locale, key), ns.i18n.t('en', key), `${locale} should localize ${key}`);
+      }
+    }
+  }
+  assert.equal(ns.i18n.t('ja-JP', 'menu.full'), ns.i18n.t('ja', 'menu.full'));
+  assert.equal(ns.i18n.t('ko-KR', 'menu.full'), ns.i18n.t('ko', 'menu.full'));
+
+  const manifest = JSON.parse(fs.readFileSync(path.join(ROOT, 'manifest.json'), 'utf8'));
+  const scripts = manifest.content_scripts?.[0]?.js || [];
+  assert.ok(scripts.includes('src/language-selector.js'));
+  assert.ok(scripts.indexOf('src/language-selector.js') < scripts.indexOf('src/content.js'));
+
+  const content = fs.readFileSync(path.join(ROOT, 'src/content.js'), 'utf8');
+  assert.match(content, /language-picker/);
+  assert.match(content, /role="listbox"/);
+  assert.match(content, /role="option"/);
+  assert.match(content, /🌐\s*语言\s*\/\s*Language/);
+  assert.doesNotMatch(content, /<select[^>]*class="language-select"/);
+});
+
+test('language selector keyboard navigation wraps across all locale options', () => {
+  const ns = loadNamespaceScript('src/language-selector.js');
+  assert.equal(typeof ns.languageSelector?.nextIndex, 'function');
+  assert.equal(ns.languageSelector.nextIndex(0, -1, 9), 8);
+  assert.equal(ns.languageSelector.nextIndex(8, 1, 9), 0);
+  assert.equal(ns.languageSelector.nextIndex(3, 1, 9), 4);
+});
+
+test('Markdown image export uses relative asset paths instead of data URIs', () => {
+  const ns = loadNamespaceScript('src/assets.js');
+  const images = [{ fileId: 'file_1', src: 'chatgpt-file://file_1', alt: 'image' }];
+  const markdown = 'Before\n\n![image](chatgpt-file://file_1)\n\nAfter';
+  const resolved = new Map([['file:file_1', 'assets/images/message-0001-image-01.png']]);
+
+  const rendered = ns.assets.renderMarkdownImages(markdown, images, resolved, true);
+  assert.match(rendered, /assets\/images\/message-0001-image-01\.png/);
+  assert.doesNotMatch(rendered, /data:image\//);
+  assert.doesNotMatch(rendered, /chatgpt-file:\/\//);
+});
+
+test('Markdown renderer converts visible Markdown syntax into semantic safe HTML for PDF', () => {
+  const ns = loadNamespaceScript('src/markdown-renderer.js');
+  assert.equal(typeof ns.markdownRenderer?.render, 'function', 'markdownRenderer.render must exist');
+  const markdown = [
+    '# Heading',
+    '',
+    '**bold** and `inline()`',
+    '',
+    '- one',
+    '- two',
+    '',
+    '> quote',
+    '',
+    '```js',
+    'const a = 1;',
+    '```',
+  ].join('\n');
+  const html = ns.markdownRenderer.render(markdown);
+  assert.match(html, /<h1>Heading<\/h1>/);
+  assert.match(html, /<strong>bold<\/strong>/);
+  assert.match(html, /<code>inline\(\)<\/code>/);
+  assert.match(html, /<ul>/);
+  assert.match(html, /<blockquote>/);
+  assert.match(html, /<pre><code class="language-js">const a = 1;<\/code><\/pre>/);
+  assert.doesNotMatch(html, /\*\*bold\*\*/);
+  assert.doesNotMatch(html, /```js/);
+  assert.doesNotMatch(html, /<script/i);
+});
+
+test('print renderer creates a self-contained printable document with embedded images', () => {
+  const ns = loadNamespaceScript('src/print.js');
+  assert.equal(typeof ns.print?.buildPrintHtml, 'function', 'print.buildPrintHtml must exist');
+  const html = ns.print.buildPrintHtml({
+    title: 'Conversation',
+    messages: [{
+      role: 'assistant',
+      markdown: 'Answer\n\n![image](chatgpt-file://file_1)',
+      images: [{ fileId: 'file_1', src: 'chatgpt-file://file_1', alt: 'image' }],
+      attachments: [],
+    }],
+    imageDataBySource: new Map([['file:file_1', 'data:image/png;base64,AAAA']]),
+    includeImages: true,
+  });
+  assert.match(html, /<!doctype html>/i);
+  assert.match(html, /data:image\/png;base64,AAAA/);
+  assert.match(html, /@page\s*\{[^}]*size:\s*A4/i);
+  assert.match(html, /max-height:\s*230mm/);
+  assert.match(html, /break-inside:\s*avoid/);
+  assert.match(html, /class="message-body"/);
+  assert.doesNotMatch(html, /class="message-text"/);
+  assert.doesNotMatch(html, /chatgpt-file:\/\//);
+});
+
+test('V1.5 PDF export requires an explicit pre-print confirmation and keeps version 1.5.0', () => {
+  const manifest = JSON.parse(fs.readFileSync(path.join(ROOT, 'manifest.json'), 'utf8'));
+  assert.equal(manifest.version, '1.5.0');
+  const scripts = manifest.content_scripts?.[0]?.js || [];
+  assert.ok(scripts.includes('src/print.js'));
+  assert.ok(scripts.indexOf('src/print.js') < scripts.indexOf('src/content.js'));
+
+  const content = fs.readFileSync(path.join(ROOT, 'src/content.js'), 'utf8');
+  assert.match(content, /format-pdf/);
+  assert.match(content, /window\.confirm\(tr\('pdf\.confirm'\)\)/);
+  assert.match(content, /exportConversation\('pdf'/);
+  assert.match(content, /printDocument/);
+});
+
+test('Markdown exports with images package conversation.md plus assets while image-free Markdown remains a plain file', () => {
+  const content = fs.readFileSync(path.join(ROOT, 'src/content.js'), 'utf8');
+  assert.match(content, /createMarkdownImagePackage/);
+  assert.match(content, /assets\/images/);
+  assert.doesNotMatch(content, /bytesToDataUri\(prepared\.bytes/);
+});
+
+test('V1.5 old-tab fallback injects Markdown renderer and custom language selector before content', () => {
+  const background = fs.readFileSync(path.join(ROOT, 'src/background.js'), 'utf8');
+  assert.match(background, /src\/markdown-renderer\.js/);
+  assert.match(background, /src\/language-selector\.js/);
+  const markdownIndex = background.indexOf("'src/markdown-renderer.js'");
+  const printIndex = background.indexOf("'src/print.js'");
+  const languageIndex = background.indexOf("'src/language-selector.js'");
+  const contentIndex = background.indexOf("'src/content.js'");
+  assert.ok(markdownIndex >= 0 && markdownIndex < printIndex);
+  assert.ok(languageIndex >= 0 && languageIndex < contentIndex);
+});
+
+test('citation resolver replaces ChatGPT cite markers with real external links from content_references', () => {
+  const ns = loadNamespaceScript('src/citation-resolver.js');
+  assert.equal(typeof ns.citations?.resolveMarkdown, 'function', 'citations.resolveMarkdown must exist');
+
+  const marker = '\uE200cite\uE202turn246161search4\uE202turn772970search21\uE201';
+  const markdown = `偏瘫，肌力4级以下 → 七级伤残。${marker}`;
+  const metadata = {
+    content_references: [{
+      matched_text: marker,
+      type: 'grouped_webpages',
+      safe_urls: [
+        'https://example.com/standard-seven',
+        'https://law.example.org/disability-grade',
+      ],
+      items: [
+        { title: '人体损伤致残程度分级', url: 'https://example.com/standard-seven' },
+        { title: '伤残等级标准', url: 'https://law.example.org/disability-grade' },
+      ],
+    }],
+  };
+
+  const resolved = ns.citations.resolveMarkdown(markdown, metadata);
+  assert.match(resolved, /\[人体损伤致残程度分级\]\(https:\/\/example\.com\/standard-seven\)/);
+  assert.match(resolved, /\[伤残等级标准\]\(https:\/\/law\.example\.org\/disability-grade\)/);
+  assert.doesNotMatch(resolved, /cite\uE202turn|turn246161search4/);
+});
+
+test('citation resolver strips unresolved internal cite markers instead of exposing turn ids', () => {
+  const ns = loadNamespaceScript('src/citation-resolver.js');
+  const marker = '\uE200cite\uE202turn1search2\uE202turn1search3\uE201';
+  const resolved = ns.citations.resolveMarkdown(`Answer ${marker} continues.`, { content_references: [] });
+  assert.equal(resolved, 'Answer continues.');
+  assert.doesNotMatch(resolved, /turn1search/);
+});
+
+test('citation resolver also accepts content-reference source records when safe_urls is absent', () => {
+  const ns = loadNamespaceScript('src/citation-resolver.js');
+  const marker = '\uE200cite\uE202turn4search1\uE201';
+  const resolved = ns.citations.resolveMarkdown(`See ${marker}`, {
+    content_references: [{
+      matched_text: marker,
+      type: 'webpage',
+      sources: [{ title: 'Official source', url: 'https://official.example/source' }],
+    }],
+  });
+  assert.match(resolved, /\[Official source\]\(https:\/\/official\.example\/source\)/);
+});
+
+test('V1.5 loads citation resolver before remote normalization and remote applies it to visible message markdown', () => {
+  const manifest = JSON.parse(fs.readFileSync(path.join(ROOT, 'manifest.json'), 'utf8'));
+  const scripts = manifest.content_scripts?.[0]?.js || [];
+  assert.ok(scripts.includes('src/citation-resolver.js'));
+  assert.ok(scripts.indexOf('src/citation-resolver.js') < scripts.indexOf('src/remote.js'));
+
+  const remote = fs.readFileSync(path.join(ROOT, 'src/remote.js'), 'utf8');
+  assert.match(remote, /ns\.citations\?\.resolveMarkdown/);
+});
+
+test('partial export message options include both User and Assistant turns in original order', () => {
+  const ns = loadNamespaceScript('src/range.js');
+  assert.equal(typeof ns.range?.getMessageOptions, 'function', 'range.getMessageOptions must exist');
+  const messages = [
+    { key: 'u1', role: 'user', text: 'Question one' },
+    { key: 'a1', role: 'assistant', text: 'Answer one' },
+    { key: 'u2', role: 'user', text: 'Question two' },
+    { key: 'a2', role: 'assistant', text: 'Answer two' },
+  ];
+  const options = ns.range.getMessageOptions(messages);
+  assert.deepEqual(options.map((item) => [item.key, item.messagePosition, item.role]), [
+    ['u1', 1, 'user'],
+    ['a1', 2, 'assistant'],
+    ['u2', 3, 'user'],
+    ['a2', 4, 'assistant'],
+  ]);
+  assert.match(options[1].label, /#2 Assistant/);
+});
+
+test('partial export supports inclusive start and end points and records both boundaries', () => {
+  const ns = loadNamespaceScript('src/range.js');
+  const messages = [
+    { key: 'u1', role: 'user', text: 'Q1' },
+    { key: 'a1', role: 'assistant', text: 'A1' },
+    { key: 'u2', role: 'user', text: 'Q2' },
+    { key: 'a2', role: 'assistant', text: 'A2' },
+    { key: 'u3', role: 'user', text: 'Q3' },
+    { key: 'a3', role: 'assistant', text: 'A3' },
+  ];
+
+  const result = ns.range.applyExportRange(messages, {
+    mode: 'partial',
+    startMessageKey: 'a1',
+    endMessageKey: 'u3',
+  });
+
+  assert.deepEqual(result.messages.map((message) => message.key), ['a1', 'u2', 'a2', 'u3']);
+  assert.equal(result.metadata.startMessagePosition, 2);
+  assert.equal(result.metadata.endMessagePosition, 5);
+  assert.equal(result.metadata.startMessageKey, 'a1');
+  assert.equal(result.metadata.endMessageKey, 'u3');
+  assert.equal(result.metadata.exportedMessageCount, 4);
+});
+
+test('partial export defaults end point to the final message and rejects an end before start', () => {
+  const ns = loadNamespaceScript('src/range.js');
+  const messages = [
+    { key: 'u1', role: 'user', text: 'Q1' },
+    { key: 'a1', role: 'assistant', text: 'A1' },
+    { key: 'u2', role: 'user', text: 'Q2' },
+    { key: 'a2', role: 'assistant', text: 'A2' },
+  ];
+
+  const defaultEnd = ns.range.applyExportRange(messages, { mode: 'partial', startMessageKey: 'a1' });
+  assert.deepEqual(defaultEnd.messages.map((message) => message.key), ['a1', 'u2', 'a2']);
+  assert.equal(defaultEnd.metadata.endMessageKey, 'a2');
+  assert.equal(defaultEnd.metadata.endMessagePosition, 4);
+
+  assert.throws(
+    () => ns.range.applyExportRange(messages, { mode: 'partial', startMessageKey: 'u2', endMessageKey: 'a1' }),
+    /截止|end/i,
+  );
+});
+
+test('PDF export warning explicitly tells users to disable browser headers and footers', () => {
+  const ns = loadNamespaceScript('src/i18n.js');
+  const zh = ns.i18n.t('zh-CN', 'pdf.confirm');
+  const en = ns.i18n.t('en', 'pdf.confirm');
+  assert.match(zh, /页眉和页脚/);
+  assert.match(en, /headers and footers/i);
+});
+
+test('new start/end range controls are localized across every supported UI locale', () => {
+  const ns = loadNamespaceScript('src/i18n.js');
+  const locales = ['zh-CN', 'en', 'ja', 'ko', 'de', 'es', 'fr', 'ru', 'uk'];
+  for (const locale of locales) {
+    for (const key of ['picker.start', 'picker.end', 'picker.confirm']) {
+      assert.notEqual(ns.i18n.t(locale, key), key);
+    }
+    const summary = ns.i18n.t(locale, 'menu.partialSummary', { start: '#2 User', end: '#5 Assistant' });
+    assert.doesNotMatch(summary, /\{label\}|\{start\}|\{end\}/);
+    assert.match(summary, /#2 User/);
+    assert.match(summary, /#5 Assistant/);
+  }
+});
+
+test('partial-range message list uses wider spacing, left-aligned text, and no thick start/end edge bars', () => {
+  const content = fs.readFileSync(path.join(ROOT, 'src/content.js'), 'utf8');
+  assert.match(content, /\.picker-list\s*\{[^}]*gap:\s*8px/s);
+  assert.match(content, /\.start-item\s*\{[^}]*text-align:\s*left/s);
+  assert.doesNotMatch(content, /\.start-item\.is-start\s*\{[^}]*border-left:\s*3px/s);
+  assert.doesNotMatch(content, /\.start-item\.is-end\s*\{[^}]*border-right:\s*3px/s);
+  assert.match(content, /\.start-item\.is-start\s*\{[^}]*border-color:/s);
+  assert.match(content, /\.start-item\.is-end\s*\{[^}]*border-color:/s);
 });

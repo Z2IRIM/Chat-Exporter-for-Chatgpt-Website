@@ -138,9 +138,18 @@
         size: attachment.size || null,
       }));
 
+    const rawMarkdown = markdownParts.join('\n\n').trim();
+    const rawText = textParts.join('\n\n').trim();
+    const resolvedMarkdown = ns.citations?.resolveMarkdown
+      ? ns.citations.resolveMarkdown(rawMarkdown, message?.metadata || {})
+      : rawMarkdown;
+    const resolvedText = ns.citations?.resolveMarkdown
+      ? ns.citations.resolveMarkdown(rawText, message?.metadata || {}).replace(/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g, '$1 ($2)')
+      : rawText;
+
     return {
-      markdown: markdownParts.join('\n\n').trim(),
-      text: textParts.join('\n\n').trim(),
+      markdown: resolvedMarkdown,
+      text: resolvedText,
       images,
       attachments,
     };

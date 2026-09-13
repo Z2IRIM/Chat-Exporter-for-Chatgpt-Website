@@ -23,8 +23,8 @@
   const UI_ROOT_ID = 'cgpt-conversation-exporter-root';
   let exportInProgress = false;
   let firstSeenSequence = 0;
-  let exportRangeSelection = { mode: 'full', startMessageKey: null, startLabel: null, url: null };
-  let exportSettings = ns.exportOptions?.normalize?.() || { includeToolDetails: false };
+  let exportRangeSelection = { mode: 'full', startMessageKey: null, startLabel: null, endMessageKey: null, endLabel: null, url: null };
+  let exportSettings = ns.exportOptions?.normalize?.() || { includeToolDetails: false, includeImages: true };
   let currentLocale = ns.i18n?.DEFAULT_LOCALE || 'zh-CN';
   let partialScanCache = null;
 
@@ -666,13 +666,14 @@
   }
 
   /**
-   * Download conversation images and rewrite message Markdown to ZIP-local asset paths.
+   * Download conversation images once and prepare compressed archive files plus reusable bytes for PDF printing.
    */
   async function archiveConversationImages(messages, onProgress, remoteContext = null) {
     if (
+      !ns.assets?.resolveImageType ||
+      !ns.assets?.compressImageForEmbedding ||
       !ns.assets?.createImageAssetPath ||
-      !ns.assets?.rewriteMarkdownImageSources ||
-      !ns.assets?.appendMissingImageReferences
+      !ns.assets?.getImageSourceKey
     ) {
       throw new Error(tr('error.imageModule'));
     }
@@ -680,27 +681,28 @@
     const uniqueSources = new Set();
     for (const message of messages) {
       for (const image of message.images || []) {
-        uniqueSources.add(image.fileId ? `file:${image.fileId}` : (image.fetchSrc || image.src));
+        const sourceKey = ns.assets.getImageSourceKey(image);
+        if (sourceKey) uniqueSources.add(sourceKey);
       }
     }
 
+    const pathBySource = new Map();
+    const binaryBySource = new Map();
     const files = [];
-    const bySource = new Map();
     let archived = 0;
     let failed = 0;
     let processed = 0;
-    let byteLength = 0;
+    let sourceByteLength = 0;
+    let archivedByteLength = 0;
+    let compressed = 0;
     const failures = [];
 
     for (let messageIndex = 0; messageIndex < messages.length; messageIndex += 1) {
       const message = messages[messageIndex];
       for (let imageIndex = 0; imageIndex < (message.images || []).length; imageIndex += 1) {
         const image = message.images[imageIndex];
-        const sourceKey = image.fileId ? `file:${image.fileId}` : (image.fetchSrc || image.src);
-        const existing = bySource.get(sourceKey);
-
-        if (existing) {
-          Object.assign(image, existing);
+        const sourceKey = ns.assets.getImageSourceKey(image);
+        if (!sourceKey || pathBySource.has(sourceKey) || failures.some((item) => item.sourceKey === sourceKey)) {
           continue;
         }
 
@@ -708,6 +710,7 @@
         try {
           let fetchSource = image.fetchSrc || image.src;
           let assetAccessToken = null;
+          let sourceName = image.originalName || null;
           if (image.fileId && remoteContext && ns.remote?.resolveFileDownload) {
             const resolved = await ns.remote.resolveFileDownload({
               fileId: image.fileId,
@@ -716,13 +719,13 @@
             });
             fetchSource = resolved.download_url;
             assetAccessToken = remoteContext.accessToken || null;
-            image.originalName ||= resolved.file_name || null;
+            sourceName ||= resolved.file_name || null;
           }
           if (!fetchSource || fetchSource.startsWith('chatgpt-file://')) {
             throw new Error(tr('error.imageUrl'));
           }
+
           const asset = await fetchImageBytes(fetchSource, assetAccessToken);
-          let sourceName = image.originalName || null;
           if (!sourceName) {
             try {
               sourceName = decodeURIComponent(new URL(fetchSource, location.href).pathname.split('/').pop() || '') || null;
@@ -736,31 +739,30 @@
             messageMimeType: image.mimeType,
             bytes: asset.bytes,
           });
+          if (!String(imageType.mimeType || '').startsWith('image/')) {
+            throw new Error(tr('error.imageDownload'));
+          }
+
+          const prepared = await ns.assets.compressImageForEmbedding({
+            bytes: asset.bytes,
+            mimeType: imageType.mimeType,
+          });
           const localPath = ns.assets.createImageAssetPath(
             messageIndex + 1,
             imageIndex + 1,
-            imageType.mimeType,
-            imageType.extension,
+            prepared.mimeType,
           );
-          const metadata = {
-            localPath,
-            mimeType: imageType.mimeType,
-            typeSource: imageType.source,
-            originalName: image.originalName || sourceName,
-            byteLength: asset.bytes.length,
-            archived: true,
-          };
-          bySource.set(sourceKey, metadata);
-          Object.assign(image, metadata);
-          files.push({ name: localPath, data: asset.bytes });
+          pathBySource.set(sourceKey, localPath);
+          binaryBySource.set(sourceKey, { bytes: prepared.bytes, mimeType: prepared.mimeType, localPath });
+          files.push({ name: localPath, data: prepared.bytes });
           archived += 1;
-          byteLength += asset.bytes.length;
+          sourceByteLength += asset.bytes.length;
+          archivedByteLength += prepared.bytes.length;
+          if (prepared.compressed) compressed += 1;
         } catch (error) {
           const messageText = error instanceof Error ? error.message : String(error);
-          const metadata = { archived: false, archiveError: messageText };
-          bySource.set(sourceKey, metadata);
-          Object.assign(image, metadata);
           failures.push({
+            sourceKey,
             fileId: image.fileId || null,
             source: image.fetchSrc || image.src || null,
             error: messageText,
@@ -774,18 +776,19 @@
           total: uniqueSources.size,
         });
       }
-
-      message.markdown = ns.assets.rewriteMarkdownImageSources(message.markdown, message.images);
-      message.markdown = ns.assets.appendMissingImageReferences(message.markdown, message.images);
     }
 
     return {
+      pathBySource,
+      binaryBySource,
       files,
       stats: {
         total: uniqueSources.size,
         archived,
         failed,
-        byteLength,
+        compressed,
+        sourceByteLength,
+        archivedByteLength,
         failures,
       },
     };
@@ -794,14 +797,14 @@
   /**
    * Create Markdown and JSON representations from scanned messages.
    */
-  function buildExport(messages, imageArchive = null, scanInfo = null, rangeMetadata = null, options = exportSettings) {
+  function buildExport(messages, imageArchive = null, scanInfo = null, rangeMetadata = null, options = exportSettings, resolvedImageSources = new Map()) {
     const title = scanInfo?.title || getConversationTitle();
     const exportedAt = new Date();
     const userCount = messages.filter((item) => item.role === 'user').length;
     const assistantCount = messages.filter((item) => item.role === 'assistant').length;
 
     const metadata = {
-      schemaVersion: 5,
+      schemaVersion: 8,
       source: 'ChatGPT',
       title,
       conversationId: scanInfo?.remoteContext?.conversationId || getConversationId(),
@@ -817,27 +820,33 @@
       startMessageId: rangeMetadata?.startMessageId || null,
       startMessagePosition: rangeMetadata?.startMessagePosition || null,
       startUserOrdinal: rangeMetadata?.startUserOrdinal || null,
+      endMessageKey: rangeMetadata?.endMessageKey || null,
+      endMessageId: rangeMetadata?.endMessageId || null,
+      endMessagePosition: rangeMetadata?.endMessagePosition || null,
       originalMessageCount: rangeMetadata?.originalMessageCount ?? messages.length,
       exportedMessageCount: rangeMetadata?.exportedMessageCount ?? messages.length,
       includeToolDetails: options?.includeToolDetails === true,
+      includeImages: options?.includeImages !== false,
       uiLocale: currentLocale,
     };
 
     const rangeLabel = metadata.exportScope === 'partial'
-      ? tr('md.partialRange', { start: metadata.startMessagePosition, total: metadata.originalMessageCount })
+      ? tr('md.partialRange', { start: metadata.startMessagePosition, end: metadata.endMessagePosition || metadata.originalMessageCount, total: metadata.originalMessageCount })
       : tr('md.fullRange');
-    const imageLabel = imageArchive
-      ? `${imageArchive.archived}/${imageArchive.total}${imageArchive.failed ? tr('md.imageFailed', { failed: imageArchive.failed }) : ''}`
+    const imageLabel = metadata.includeImages
+      ? (imageArchive
+        ? `${imageArchive.archived}/${imageArchive.total}${imageArchive.failed ? tr('md.imageFailed', { failed: imageArchive.failed }) : ''}`
+        : tr('md.included'))
       : tr('md.imageNotArchived');
 
-    const separator = currentLocale === 'en' ? ': ' : '：';
-    const messageCountLabel = currentLocale === 'en'
-      ? `${messages.length} (User ${userCount} / Assistant ${assistantCount})`
-      : `${messages.length}（User ${userCount} / Assistant ${assistantCount}）`;
+    const separator = currentLocale === 'zh-CN' ? '：' : ': ';
+    const messageCountLabel = currentLocale === 'zh-CN'
+      ? `${messages.length}（User ${userCount} / Assistant ${assistantCount}）`
+      : `${messages.length} (User ${userCount} / Assistant ${assistantCount})`;
     const markdownParts = [
       `# ${title}`,
       '',
-      `- ${tr('md.exportedAt')}${separator}${exportedAt.toLocaleString(currentLocale === 'en' ? 'en' : 'zh-CN')}`,
+      `- ${tr('md.exportedAt')}${separator}${exportedAt.toLocaleString(currentLocale)}`,
       `- ${tr('md.source')}${separator}${location.href}`,
       `- ${tr('md.messageCount')}${separator}${messageCountLabel}`,
       `- ${tr('md.range')}${separator}${rangeLabel}`,
@@ -851,7 +860,10 @@
 
     messages.forEach((message, position) => {
       markdownParts.push(`## ${message.role === 'user' ? 'User' : 'Assistant'}`, '');
-      if (message.markdown) markdownParts.push(message.markdown, '');
+      const renderedMarkdown = ns.assets?.renderMarkdownImages
+        ? ns.assets.renderMarkdownImages(message.markdown, message.images, resolvedImageSources, metadata.includeImages)
+        : message.markdown;
+      if (renderedMarkdown) markdownParts.push(renderedMarkdown, '');
       if (message.attachments.length) {
         markdownParts.push(`**${tr('md.attachments')}**`, '');
         for (const attachment of message.attachments) {
@@ -901,6 +913,69 @@
     downloadBlob(new Blob([text], { type: `${mimeType};charset=utf-8` }), filename);
   }
 
+  /** Package Markdown and its relative image assets into one portable ZIP archive. */
+  function createMarkdownImagePackage(markdown, imageFiles) {
+    if (!ns.zip?.createZip) throw new Error(tr('error.zipModule'));
+    const assetFiles = (imageFiles || []).filter((file) => String(file?.name || '').startsWith('assets/images/'));
+    return ns.zip.createZip([
+      { name: 'conversation.md', data: markdown },
+      ...assetFiles,
+    ]);
+  }
+
+  /** Convert archived image bytes to data URIs only for the browser print/PDF path. */
+  function createPrintableImageData(binaryBySource) {
+    const output = new Map();
+    if (!ns.assets?.bytesToDataUri) return output;
+    for (const [sourceKey, asset] of binaryBySource || []) {
+      output.set(sourceKey, ns.assets.bytesToDataUri(asset.bytes, asset.mimeType));
+    }
+    return output;
+  }
+
+  /** Print a self-contained HTML document in an isolated iframe using the browser's system print dialog. */
+  async function printDocument(html) {
+    const frame = document.createElement('iframe');
+    frame.setAttribute('aria-hidden', 'true');
+    frame.style.position = 'fixed';
+    frame.style.right = '0';
+    frame.style.bottom = '0';
+    frame.style.width = '1px';
+    frame.style.height = '1px';
+    frame.style.opacity = '0';
+    frame.style.pointerEvents = 'none';
+    const loaded = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(tr('error.printFailed'))), 10000);
+      frame.addEventListener('load', () => {
+        clearTimeout(timer);
+        resolve();
+      }, { once: true });
+    });
+    frame.srcdoc = html;
+    document.documentElement.appendChild(frame);
+
+    try {
+      await loaded;
+      const printWindow = frame.contentWindow;
+      const printDocumentRef = frame.contentDocument;
+      if (!printWindow || !printDocumentRef) throw new Error(tr('error.printFailed'));
+      await printDocumentRef.fonts?.ready;
+      await Promise.all([...printDocumentRef.images].map((image) => image.complete
+        ? Promise.resolve()
+        : new Promise((resolve) => {
+            image.addEventListener('load', resolve, { once: true });
+            image.addEventListener('error', resolve, { once: true });
+          })));
+      printWindow.addEventListener('afterprint', () => frame.remove(), { once: true });
+      printWindow.focus();
+      printWindow.print();
+      setTimeout(() => frame.remove(), 120000);
+    } catch (error) {
+      frame.remove();
+      throw error;
+    }
+  }
+
   /**
    * Export the current conversation in the requested format.
    */
@@ -936,22 +1011,42 @@
       const messages = ranged.messages;
 
       let imageArchive = null;
+      let pathBySource = new Map();
+      let binaryBySource = new Map();
       let imageFiles = [];
-      if (format === 'zip') {
+      if ((format === 'md' || format === 'zip' || format === 'pdf') && exportSettings.includeImages) {
         const archived = await archiveConversationImages(messages, ({ phase, count, total }) => {
           updateProgress(`${phase} · ${count}/${total}`);
         }, scanInfo.remoteContext);
         imageArchive = archived.stats;
+        pathBySource = archived.pathBySource;
+        binaryBySource = archived.binaryBySource;
         imageFiles = archived.files;
       }
 
       updateProgress(tr('progress.generate'));
-      const output = buildExport(messages, imageArchive, scanInfo, ranged.metadata, exportSettings);
+      const output = buildExport(messages, imageArchive, scanInfo, ranged.metadata, exportSettings, pathBySource);
 
       if (format === 'md') {
-        downloadText(output.markdown, `${output.baseName}.md`, 'text/markdown');
+        if (exportSettings.includeImages) {
+          const packageBlob = createMarkdownImagePackage(output.markdown, imageFiles);
+          downloadBlob(packageBlob, `${output.baseName}_markdown.zip`);
+        } else {
+          downloadText(output.markdown, `${output.baseName}.md`, 'text/markdown');
+        }
       } else if (format === 'json') {
         downloadText(output.json, `${output.baseName}.json`, 'application/json');
+      } else if (format === 'pdf') {
+        if (!ns.print?.buildPrintHtml) throw new Error(tr('error.printModule'));
+        updateProgress(tr('progress.preparePdf'));
+        const imageDataBySource = exportSettings.includeImages ? createPrintableImageData(binaryBySource) : new Map();
+        const html = ns.print.buildPrintHtml({
+          title: output.metadata.title,
+          messages,
+          imageDataBySource,
+          includeImages: exportSettings.includeImages,
+        });
+        await printDocument(html);
       } else {
         if (!ns.zip?.createZip) throw new Error(tr('error.zipModule'));
         const zipBlob = ns.zip.createZip([
@@ -966,18 +1061,26 @@
         ? tr('images.summary', { archived: imageArchive.archived, total: imageArchive.total }) + (imageArchive.failed ? tr('images.failed', { failed: imageArchive.failed }) : '')
         : '';
       const sourceSummary = output.metadata.extractionMode === 'api' ? tr('source.api') : tr('source.dom');
-      showToast(
-        tr('toast.complete', {
-          count: output.metadata.messageCount,
-          user: output.metadata.counts.user,
-          assistant: output.metadata.counts.assistant,
-          scope: output.metadata.exportScope === 'partial' ? tr('scope.partial') : tr('scope.full'),
-          source: sourceSummary,
-          images: imageSummary,
-        }),
-        imageArchive?.failed ? 'warning' : 'success',
-        imageArchive?.failed ? 7000 : 4500,
-      );
+      if (format === 'pdf') {
+        showToast(
+          tr('toast.printOpened'),
+          imageArchive?.failed ? 'warning' : 'success',
+          7000,
+        );
+      } else {
+        showToast(
+          tr('toast.complete', {
+            count: output.metadata.messageCount,
+            user: output.metadata.counts.user,
+            assistant: output.metadata.counts.assistant,
+            scope: output.metadata.exportScope === 'partial' ? tr('scope.partial') : tr('scope.full'),
+            source: sourceSummary,
+            images: imageSummary,
+          }),
+          imageArchive?.failed ? 'warning' : 'success',
+          imageArchive?.failed ? 7000 : 4500,
+        );
+      }
       chrome.runtime?.sendMessage?.({
         type: 'CGPT_EXPORT_COMPLETE',
         messageCount: output.metadata.messageCount,
@@ -1005,9 +1108,11 @@
           mode: 'partial',
           startMessageKey: selection.startMessageKey,
           startLabel: selection.startLabel || null,
+          endMessageKey: selection.endMessageKey || null,
+          endLabel: selection.endLabel || null,
           url: selection.url || location.href,
         }
-      : { mode: 'full', startMessageKey: null, startLabel: null, url: null };
+      : { mode: 'full', startMessageKey: null, startLabel: null, endMessageKey: null, endLabel: null, url: null };
     updateRangeUi();
   }
 
@@ -1020,7 +1125,10 @@
       button.classList.toggle('active', button.dataset.rangeMode === exportRangeSelection.mode);
     }
     ui.rangeSummary.textContent = exportRangeSelection.mode === 'partial'
-      ? tr('menu.partialSummary', { label: exportRangeSelection.startLabel || tr('menu.partialFallback') })
+      ? tr('menu.partialSummary', {
+          start: exportRangeSelection.startLabel || tr('menu.partialFallback'),
+          end: exportRangeSelection.endLabel || tr('picker.last'),
+        })
       : tr('menu.fullSummary');
   }
 
@@ -1030,7 +1138,35 @@
   function closePartialPicker({ reopenMenu = false } = {}) {
     const current = ensureUi();
     current.pickerBackdrop.classList.remove('open');
+    current.pickerPanel?.classList.remove('loading');
+    current.pickerSpinner?.setAttribute('hidden', 'hidden');
     if (reopenMenu) current.menu.classList.add('open');
+  }
+
+
+  /**
+   * Render loading placeholders so partial-range scanning never appears frozen.
+   */
+  function renderPickerLoadingState(current, statusText) {
+    current.pickerPanel?.classList.add('loading');
+    current.pickerSpinner?.removeAttribute('hidden');
+    current.pickerStatus.textContent = statusText || tr('picker.loading');
+    current.pickerList.replaceChildren();
+    const loader = document.createElement('div');
+    loader.className = 'picker-list-loader';
+    loader.setAttribute('aria-hidden', 'true');
+    const loaderGlow = document.createElement('div');
+    loaderGlow.className = 'picker-list-loader-glow';
+    loader.appendChild(loaderGlow);
+    current.pickerList.appendChild(loader);
+  }
+
+  /**
+   * Clear the partial-range loading state once the message list is ready.
+   */
+  function clearPickerLoadingState(current) {
+    current.pickerPanel?.classList.remove('loading');
+    current.pickerSpinner?.setAttribute('hidden', 'hidden');
   }
 
   /**
@@ -1040,45 +1176,109 @@
     const current = ensureUi();
     current.menu.classList.remove('open');
     current.pickerBackdrop.classList.add('open');
-    current.pickerStatus.textContent = tr('picker.loading');
-    current.pickerList.replaceChildren();
+    renderPickerLoadingState(current, tr('picker.loading'));
 
     try {
       let scanInfo = partialScanCache?.url === location.href && partialScanCache?.includeToolDetails === exportSettings.includeToolDetails ? partialScanCache.scanInfo : null;
       if (!scanInfo?.messages?.length) {
         scanInfo = await scanConversation(({ phase, count, total }) => {
-          current.pickerStatus.textContent = total
-            ? `${phase} · ${count}/${total}`
-            : `${phase}${count ? ` · ${count}` : ''}`;
+          renderPickerLoadingState(current, total ? `${phase} · ${count}/${total}` : `${phase}${count ? ` · ${count}` : ''}`);
         }, exportSettings);
         partialScanCache = { url: location.href, includeToolDetails: exportSettings.includeToolDetails, scanInfo };
       }
 
-      if (!ns.range?.getUserStartOptions) throw new Error(tr('error.rangeModule'));
-      const options = ns.range.getUserStartOptions(scanInfo.messages);
-      if (!options.length) throw new Error(tr('error.noUserStart'));
+      if (!ns.range?.getMessageOptions) throw new Error(tr('error.rangeModule'));
+      const options = ns.range.getMessageOptions(scanInfo.messages);
+      if (!options.length) throw new Error(tr('error.noMessages'));
 
-      current.pickerStatus.textContent = tr('picker.choose', { count: options.length });
-      const fragment = document.createDocumentFragment();
-      for (const option of options) {
-        const button = document.createElement('button');
-        button.type = 'button';
-        button.className = 'start-item';
-        button.dataset.startKey = option.key;
-        button.textContent = option.label;
-        button.addEventListener('click', () => {
-          setExportRangeSelection({
-            mode: 'partial',
-            startMessageKey: option.key,
-            startLabel: option.label,
-            url: location.href,
+      const byKey = new Map(options.map((option) => [option.key, option]));
+      let startOption = byKey.get(exportRangeSelection.startMessageKey) || options[0];
+      let endOption = byKey.get(exportRangeSelection.endMessageKey) || options.at(-1);
+      if (endOption.messagePosition < startOption.messagePosition) endOption = options.at(-1);
+      let boundary = 'start';
+
+      const render = () => {
+        clearPickerLoadingState(current);
+        current.pickerStart.textContent = `${tr('picker.start')}: ${startOption.label}`;
+        current.pickerEnd.textContent = `${tr('picker.end')}: ${endOption.label}`;
+        current.pickerStart.classList.toggle('active', boundary === 'start');
+        current.pickerEnd.classList.toggle('active', boundary === 'end');
+        current.pickerStatus.textContent = tr('picker.choose', { boundary: boundary === 'start' ? tr('picker.start') : tr('picker.end'), count: options.length });
+        current.pickerList.replaceChildren();
+        const fragment = document.createDocumentFragment();
+        const startPosition = startOption.messagePosition;
+        const endPosition = endOption.messagePosition;
+        for (const option of options) {
+          const invalidEnd = boundary === 'end' && option.messagePosition < startPosition;
+          const button = document.createElement('button');
+          const isStart = option.key === startOption.key;
+          const isEnd = option.key === endOption.key;
+          const inRange = option.messagePosition >= startPosition && option.messagePosition <= endPosition;
+          const isActiveSelection = (boundary === 'start' && isStart) || (boundary === 'end' && isEnd);
+          button.type = 'button';
+          button.className = 'start-item';
+          button.dataset.messageKey = option.key;
+          button.disabled = invalidEnd;
+          if (isStart) button.classList.add('is-start');
+          if (isEnd) button.classList.add('is-end');
+          if (inRange) button.classList.add('in-range');
+          if (isActiveSelection) button.classList.add('selected');
+
+          const text = document.createElement('div');
+          text.className = 'start-item-text';
+          text.textContent = option.label;
+          button.appendChild(text);
+
+          if (isStart || isEnd) {
+            const badges = document.createElement('div');
+            badges.className = 'start-item-badges';
+            if (isStart) {
+              const badge = document.createElement('span');
+              badge.className = 'start-item-badge start';
+              badge.textContent = tr('picker.start');
+              badges.appendChild(badge);
+            }
+            if (isEnd) {
+              const badge = document.createElement('span');
+              badge.className = 'start-item-badge end';
+              badge.textContent = tr('picker.end');
+              badges.appendChild(badge);
+            }
+            button.appendChild(badges);
+          }
+
+          button.addEventListener('click', () => {
+            if (boundary === 'start') {
+              startOption = option;
+              if (endOption.messagePosition < startOption.messagePosition) endOption = options.at(-1);
+              boundary = 'end';
+            } else {
+              endOption = option;
+            }
+            render();
           });
-          closePartialPicker({ reopenMenu: true });
+          fragment.appendChild(button);
+        }
+        current.pickerList.appendChild(fragment);
+      };
+
+      current.pickerStart.onclick = () => { boundary = 'start'; render(); };
+      current.pickerEnd.onclick = () => { boundary = 'end'; render(); };
+      current.pickerConfirm.onclick = () => {
+        setExportRangeSelection({
+          mode: 'partial',
+          startMessageKey: startOption.key,
+          startLabel: startOption.label,
+          endMessageKey: endOption.key,
+          endLabel: endOption.label,
+          url: location.href,
         });
-        fragment.appendChild(button);
-      }
-      current.pickerList.appendChild(fragment);
+        closePartialPicker({ reopenMenu: true });
+      };
+      render();
     } catch (error) {
+      clearPickerLoadingState(current);
+      current.pickerList.replaceChildren();
       const message = error instanceof Error ? error.message : String(error);
       current.pickerStatus.textContent = tr('picker.failed', { message });
     }
@@ -1096,17 +1296,21 @@
     ui.optionsTitle.textContent = tr('menu.optionsTitle');
     ui.toolDetailsLabel.textContent = tr('menu.toolDetails');
     ui.toolDetailsHint.textContent = tr('menu.toolDetailsHint');
+    ui.imagesLabel.textContent = tr('menu.images');
+    ui.imagesHint.textContent = tr('menu.imagesHint');
     ui.languageTitle.textContent = tr('menu.languageTitle');
     ui.menuHint.textContent = tr('menu.hint');
     ui.formatZip.textContent = tr('menu.zip');
     ui.formatMd.textContent = tr('menu.md');
+    ui.formatPdf.textContent = tr('menu.pdf');
     ui.formatJson.textContent = tr('menu.json');
     ui.pickerTitle.textContent = tr('picker.title');
+    ui.pickerStart.textContent = tr('picker.start');
+    ui.pickerEnd.textContent = tr('picker.end');
+    ui.pickerConfirm.textContent = tr('picker.confirm');
     ui.pickerClose.setAttribute('aria-label', tr('picker.close'));
     ui.pickerBackdrop.querySelector('.picker')?.setAttribute('aria-label', tr('picker.title'));
-    for (const button of ui.languageButtons) {
-      button.classList.toggle('active', button.dataset.locale === currentLocale);
-    }
+    updateLanguagePickerUi();
     updateRangeUi();
   }
 
@@ -1114,10 +1318,34 @@
    * Persist the tool-detail option and invalidate cached normalized API messages.
    */
   async function setIncludeToolDetails(enabled) {
-    exportSettings = ns.exportOptions?.normalize?.({ ...exportSettings, includeToolDetails: enabled }) || { includeToolDetails: enabled === true };
+    exportSettings = ns.exportOptions?.normalize?.({ ...exportSettings, includeToolDetails: enabled }) || { includeToolDetails: enabled === true, includeImages: exportSettings.includeImages !== false };
     partialScanCache = null;
     if (ui) ui.toolDetailsInput.checked = exportSettings.includeToolDetails;
     await ns.exportOptions?.save?.(exportSettings);
+  }
+
+  /**
+   * Persist whether exports should download conversation images.
+   */
+  async function setIncludeImages(enabled) {
+    exportSettings = ns.exportOptions?.normalize?.({ ...exportSettings, includeImages: enabled }) || {
+      includeToolDetails: exportSettings.includeToolDetails === true,
+      includeImages: enabled !== false,
+    };
+    if (ui) ui.imagesInput.checked = exportSettings.includeImages;
+    await ns.exportOptions?.save?.(exportSettings);
+  }
+
+  /** Update the custom language listbox to reflect the active locale. */
+  function updateLanguagePickerUi() {
+    if (!ui) return;
+    const labels = ns.i18n?.LOCALE_LABELS || {};
+    ui.languageCurrent.textContent = labels[currentLocale] || currentLocale;
+    for (const option of ui.languageOptions || []) {
+      const selected = option.dataset.locale === currentLocale;
+      option.setAttribute('aria-selected', selected ? 'true' : 'false');
+      option.tabIndex = selected ? 0 : -1;
+    }
   }
 
   /**
@@ -1139,7 +1367,11 @@
     ]);
     exportSettings = ns.exportOptions?.normalize?.(loadedOptions) || exportSettings;
     currentLocale = ns.i18n?.normalizeLocale?.(loadedLocale) || currentLocale;
-    if (ui) ui.toolDetailsInput.checked = exportSettings.includeToolDetails;
+    if (ui) {
+      ui.toolDetailsInput.checked = exportSettings.includeToolDetails;
+      ui.imagesInput.checked = exportSettings.includeImages;
+      updateLanguagePickerUi();
+    }
     applyUiLanguage();
   }
 
@@ -1178,23 +1410,55 @@
         .option-copy { display: grid; gap: 2px; min-width: 0; }
         .option-label { font-size: 12px; line-height: 1.35; color: rgba(255,255,255,.9); }
         .option-hint { font-size: 10px; line-height: 1.35; color: rgba(255,255,255,.48); }
-        .language-row { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
-        .lang-option { all: unset; box-sizing: border-box; cursor: pointer; border-radius: 8px; border: 1px solid rgba(255,255,255,.11); padding: 7px 8px; text-align: center; font-size: 11px; color: rgba(255,255,255,.72); }
-        .lang-option:hover { background: rgba(255,255,255,.07); }
-        .lang-option.active { background: rgba(255,255,255,.14); border-color: rgba(255,255,255,.28); color: #fff; }
+        .language-picker { position: relative; }
+        .language-trigger { width: 100%; display: flex; align-items: center; justify-content: space-between; gap: 10px; border: 1px solid rgba(255,255,255,.13); border-radius: 9px; padding: 8px 10px; background: rgba(255,255,255,.07); color: #fff; font: inherit; font-size: 12px; line-height: 1.3; cursor: pointer; outline: none; text-align: left; }
+        .language-trigger:hover, .language-trigger:focus-visible { background: rgba(255,255,255,.11); border-color: rgba(255,255,255,.24); }
+        .language-chevron { color: rgba(255,255,255,.5); font-size: 10px; transition: transform .14s ease; }
+        .language-picker.open .language-chevron { transform: rotate(180deg); }
+        .language-list { position: absolute; left: 0; right: 0; top: calc(100% + 6px); z-index: 5; display: none; max-height: 260px; overflow: auto; padding: 5px; border: 1px solid rgba(255,255,255,.14); border-radius: 11px; background: rgba(35,35,35,.995); box-shadow: 0 16px 38px rgba(0,0,0,.34); backdrop-filter: blur(18px); outline: none; }
+        .language-picker.open .language-list { display: grid; gap: 2px; }
+        .language-option { all: unset; box-sizing: border-box; display: flex; width: 100%; align-items: center; justify-content: space-between; gap: 10px; cursor: pointer; border-radius: 7px; padding: 8px 9px; color: rgba(255,255,255,.82); font-size: 12px; line-height: 1.25; }
+        .language-option:hover, .language-option:focus-visible { background: rgba(255,255,255,.09); color: #fff; }
+        .language-option[aria-selected="true"] { background: rgba(255,255,255,.13); color: #fff; }
+        .language-check { opacity: 0; color: rgba(255,255,255,.82); }
+        .language-option[aria-selected="true"] .language-check { opacity: 1; }
         .divider { height: 1px; background: rgba(255,255,255,.08); margin: 1px 0; }
         .hint { color: rgba(255,255,255,.58); font-size: 11px; padding: 3px 4px 2px; }
         .picker-backdrop { position: fixed; inset: 0; z-index: 2147483647; display: none; align-items: center; justify-content: center; padding: 16px; background: rgba(0,0,0,.46); font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
         .picker-backdrop.open { display: flex; }
-        .picker { width: min(680px, calc(100vw - 32px)); max-height: min(76vh, 760px); display: grid; grid-template-rows: auto auto minmax(0, 1fr); overflow: hidden; border-radius: 16px; border: 1px solid rgba(127,127,127,.28); background: rgba(28,28,28,.985); color: #fff; box-shadow: 0 24px 80px rgba(0,0,0,.42); }
+        .picker { width: min(760px, calc(100vw - 32px)); max-height: min(80vh, 800px); display: grid; grid-template-rows: auto auto auto minmax(0, 1fr) auto; overflow: hidden; border-radius: 16px; border: 1px solid rgba(127,127,127,.28); background: rgba(28,28,28,.985); color: #fff; box-shadow: 0 24px 80px rgba(0,0,0,.42); }
         .picker-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 16px 9px; }
         .picker-title { font-size: 14px; font-weight: 720; }
         .picker-close { all: unset; cursor: pointer; width: 28px; height: 28px; display: grid; place-items: center; border-radius: 8px; color: rgba(255,255,255,.68); font-size: 18px; }
         .picker-close:hover { background: rgba(255,255,255,.08); color: #fff; }
-        .picker-status { color: rgba(255,255,255,.58); font-size: 11px; padding: 0 16px 10px; }
-        .picker-list { min-height: 110px; overflow: auto; padding: 0 8px 10px; }
-        .start-item { all: unset; box-sizing: border-box; display: block; width: 100%; cursor: pointer; border-radius: 9px; padding: 10px 11px; color: rgba(255,255,255,.86); font-size: 12px; line-height: 1.45; overflow-wrap: anywhere; }
+        .picker-status-row { display:flex; align-items:center; gap:10px; min-height: 18px; padding: 0 16px 10px; }
+        .picker-status { color: rgba(255,255,255,.58); font-size: 11px; min-width: 0; }
+        .picker-spinner { width: 14px; height: 14px; border-radius: 999px; border: 2px solid rgba(255,255,255,.18); border-top-color: rgba(255,255,255,.88); animation: cgpt-export-spin .8s linear infinite; flex: 0 0 auto; }
+        .picker-spinner[hidden] { display: none; }
+        .picker-list { min-height: 110px; overflow: auto; padding: 0 8px 10px; display: grid; gap: 8px; align-content: start; }
+        .picker-list-loader { position: relative; min-height: 380px; border-radius: 12px; border: 1px solid rgba(255,255,255,.07); background: linear-gradient(180deg, rgba(255,255,255,.04), rgba(255,255,255,.02)); overflow: hidden; box-shadow: inset 0 1px 0 rgba(255,255,255,.03); }
+        .picker-list-loader::before { content: ''; position: absolute; inset: 0; background: linear-gradient(180deg, rgba(255,255,255,.02), rgba(255,255,255,0)); }
+        .picker-list-loader-glow { position: absolute; inset: -20% -30%; background: linear-gradient(90deg, rgba(255,255,255,0) 0%, rgba(255,255,255,.06) 28%, rgba(255,255,255,.16) 50%, rgba(255,255,255,.06) 72%, rgba(255,255,255,0) 100%); transform: translateX(-55%); animation: cgpt-export-panel-shimmer 1.35s ease-in-out infinite; }
+        .start-item { all: unset; box-sizing: border-box; display: grid; grid-template-columns: minmax(0,1fr) auto; align-items: start; gap: 10px; width: 100%; cursor: pointer; border-radius: 9px; padding: 11px 12px; color: rgba(255,255,255,.86); font-size: 12px; line-height: 1.45; overflow-wrap: anywhere; border: 1px solid rgba(255,255,255,.055); background: rgba(255,255,255,.035); text-align: left; }
         .start-item:hover { background: rgba(255,255,255,.09); }
+        .start-item.selected { border-color: rgba(255,255,255,.28); box-shadow: inset 0 0 0 1px rgba(255,255,255,.06); color: #fff; }
+        .start-item.in-range:not(.is-start):not(.is-end) { background: rgba(255,255,255,.05); }
+        .start-item.is-start { border-color: rgba(94, 180, 255, .56); background: rgba(94, 180, 255, .11); }
+        .start-item.is-end { border-color: rgba(255, 196, 94, .56); background: rgba(255, 196, 94, .11); }
+        .start-item.is-start.is-end { border-color: rgba(190, 171, 255, .56); background: rgba(190, 171, 255, .11); }
+        .start-item:disabled { opacity: .3; cursor: not-allowed; }
+        .start-item-text { min-width: 0; text-align: left; }
+        .start-item-badges { display:flex; flex-wrap: wrap; justify-content:flex-end; gap: 6px; }
+        .start-item-badge { display:inline-flex; align-items:center; padding: 2px 7px; border-radius: 999px; font-size: 10px; line-height: 1.2; border: 1px solid rgba(255,255,255,.12); background: rgba(255,255,255,.08); color: rgba(255,255,255,.92); }
+        .start-item-badge.start { border-color: rgba(94, 180, 255, .34); background: rgba(94, 180, 255, .18); }
+        .start-item-badge.end { border-color: rgba(255, 196, 94, .34); background: rgba(255, 196, 94, .18); }
+        .picker-boundaries { display:grid; grid-template-columns:1fr 1fr; gap:8px; padding:0 16px 10px; }
+        .picker-boundary { all:unset; box-sizing:border-box; cursor:pointer; border:1px solid rgba(255,255,255,.12); border-radius:9px; padding:9px 10px; font-size:11px; line-height:1.35; color:rgba(255,255,255,.75); overflow-wrap:anywhere; }
+        .picker-boundary.active { background:rgba(255,255,255,.12); border-color:rgba(255,255,255,.28); color:#fff; }
+        .picker-actions { display:flex; justify-content:flex-end; padding:10px 16px 14px; border-top:1px solid rgba(255,255,255,.08); }
+        .picker-confirm { all:unset; cursor:pointer; border-radius:9px; padding:8px 13px; background:#fff; color:#111; font-size:12px; font-weight:700; }
+        @keyframes cgpt-export-spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+        @keyframes cgpt-export-panel-shimmer { 0% { transform: translateX(-55%); } 100% { transform: translateX(55%); } }
         .progress { display: none; position: absolute; right: 0; bottom: -34px; width: max-content; max-width: 320px; color: rgba(255,255,255,.86); background: rgba(28,28,28,.92); border: 1px solid rgba(127,127,127,.22); border-radius: 8px; padding: 6px 9px; font-size: 11px; box-shadow: 0 7px 20px rgba(0,0,0,.18); }
         .progress.visible { display: block; }
         .toast { position: fixed; right: 18px; bottom: 24px; max-width: min(420px, calc(100vw - 36px)); padding: 10px 12px; border-radius: 10px; background: rgba(28,28,28,.96); color: white; border: 1px solid rgba(127,127,127,.28); font-size: 13px; line-height: 1.45; box-shadow: 0 14px 34px rgba(0,0,0,.28); opacity: 0; transform: translateY(7px); pointer-events: none; transition: opacity .16s ease, transform .16s ease; }
@@ -1217,18 +1481,39 @@
             <input class="tool-details-input" type="checkbox">
             <span class="option-copy">
               <span class="option-label tool-details-label">包含 GPT 工具调用详情</span>
-              <span class="option-hint tool-details-hint">关闭后仍保留工具生成的可见图片</span>
+              <span class="option-hint tool-details-hint">关闭后不导出工具调用参数与工具文本结果</span>
             </span>
           </label>
-          <div class="section-title language-title">语言</div>
-          <div class="language-row">
-            <button class="lang-option active" data-locale="zh-CN" type="button">简体中文</button>
-            <button class="lang-option" data-locale="en" type="button">English</button>
+          <label class="option-row">
+            <input class="images-input" type="checkbox" checked>
+            <span class="option-copy">
+              <span class="option-label images-label">拉取对话图片</span>
+              <span class="option-hint images-hint">Markdown 使用 MD + 图片资源包；PDF 会将图片嵌入打印文档</span>
+            </span>
+          </label>
+          <div class="section-title language-title">🌐 语言 / Language</div>
+          <div class="language-picker">
+            <button class="language-trigger" type="button" aria-haspopup="listbox" aria-expanded="false">
+              <span class="language-current">简体中文</span>
+              <span class="language-chevron" aria-hidden="true">▼</span>
+            </button>
+            <div class="language-list" role="listbox" tabindex="-1" aria-label="Language">
+              <button class="language-option" type="button" role="option" data-locale="zh-CN" aria-selected="true"><span>简体中文</span><span class="language-check">✓</span></button>
+              <button class="language-option" type="button" role="option" data-locale="en" aria-selected="false"><span>English</span><span class="language-check">✓</span></button>
+              <button class="language-option" type="button" role="option" data-locale="ja" aria-selected="false"><span>日本語</span><span class="language-check">✓</span></button>
+              <button class="language-option" type="button" role="option" data-locale="ko" aria-selected="false"><span>한국어</span><span class="language-check">✓</span></button>
+              <button class="language-option" type="button" role="option" data-locale="de" aria-selected="false"><span>Deutsch</span><span class="language-check">✓</span></button>
+              <button class="language-option" type="button" role="option" data-locale="es" aria-selected="false"><span>Español</span><span class="language-check">✓</span></button>
+              <button class="language-option" type="button" role="option" data-locale="fr" aria-selected="false"><span>Français</span><span class="language-check">✓</span></button>
+              <button class="language-option" type="button" role="option" data-locale="ru" aria-selected="false"><span>Русский</span><span class="language-check">✓</span></button>
+              <button class="language-option" type="button" role="option" data-locale="uk" aria-selected="false"><span>Українська</span><span class="language-check">✓</span></button>
+            </div>
           </div>
           <div class="divider"></div>
-          <div class="hint menu-hint">ZIP 会归档可下载图片；部分导出从选定 User 消息开始直到当前末尾</div>
-          <button class="item format-zip" data-format="zip">导出 ZIP（Markdown + JSON + 图片）</button>
-          <button class="item format-md" data-format="md">仅导出 Markdown</button>
+          <div class="hint menu-hint">部分导出从选定 User 消息开始直到当前末尾；JSON 仅保存图片元数据</div>
+          <button class="item format-zip" data-format="zip">导出 ZIP（Markdown + JSON）</button>
+          <button class="item format-md" data-format="md">导出 Markdown</button>
+          <button class="item format-pdf" data-format="pdf">导出 PDF</button>
           <button class="item format-json" data-format="json">仅导出 JSON</button>
         </div>
         <button class="button" type="button">↓ 导出</button>
@@ -1240,8 +1525,10 @@
             <div class="picker-title">选择部分导出的起始消息</div>
             <button class="picker-close" type="button" aria-label="关闭">×</button>
           </div>
-          <div class="picker-status">正在读取完整对话…</div>
+          <div class="picker-status-row"><div class="picker-spinner" aria-hidden="true" hidden></div><div class="picker-status">正在读取完整对话…</div></div>
+          <div class="picker-boundaries"><button class="picker-boundary picker-start" type="button">起始点</button><button class="picker-boundary picker-end" type="button">截止点</button></div>
           <div class="picker-list"></div>
+          <div class="picker-actions"><button class="picker-confirm" type="button">使用此范围</button></div>
         </div>
       </div>
       <div class="toast"></div>
@@ -1254,6 +1541,8 @@
     const rangeButtons = [...shadow.querySelectorAll('[data-range-mode]')];
     const rangeSummary = shadow.querySelector('.range-summary');
     const pickerBackdrop = shadow.querySelector('.picker-backdrop');
+    const pickerPanel = shadow.querySelector('.picker');
+    const pickerSpinner = shadow.querySelector('.picker-spinner');
     const pickerStatus = shadow.querySelector('.picker-status');
     const pickerList = shadow.querySelector('.picker-list');
     const pickerClose = shadow.querySelector('.picker-close');
@@ -1262,17 +1551,34 @@
     const toolDetailsInput = shadow.querySelector('.tool-details-input');
     const toolDetailsLabel = shadow.querySelector('.tool-details-label');
     const toolDetailsHint = shadow.querySelector('.tool-details-hint');
+    const imagesInput = shadow.querySelector('.images-input');
+    const imagesLabel = shadow.querySelector('.images-label');
+    const imagesHint = shadow.querySelector('.images-hint');
     const languageTitle = shadow.querySelector('.language-title');
-    const languageButtons = [...shadow.querySelectorAll('[data-locale]')];
+    const languagePicker = shadow.querySelector('.language-picker');
+    const languageTrigger = shadow.querySelector('.language-trigger');
+    const languageCurrent = shadow.querySelector('.language-current');
+    const languageList = shadow.querySelector('.language-list');
+    const languageOptions = [...shadow.querySelectorAll('.language-option')];
     const menuHint = shadow.querySelector('.menu-hint');
     const formatZip = shadow.querySelector('.format-zip');
     const formatMd = shadow.querySelector('.format-md');
+    const formatPdf = shadow.querySelector('.format-pdf');
     const formatJson = shadow.querySelector('.format-json');
     const pickerTitle = shadow.querySelector('.picker-title');
+    const pickerStart = shadow.querySelector('.picker-start');
+    const pickerEnd = shadow.querySelector('.picker-end');
+    const pickerConfirm = shadow.querySelector('.picker-confirm');
 
     button.addEventListener('click', () => {
       if (exportInProgress) return;
-      menu.classList.toggle('open');
+      if (menu.classList.contains('open')) {
+        menu.classList.remove('open');
+        languagePicker.classList.remove('open');
+        languageTrigger.setAttribute('aria-expanded', 'false');
+      } else {
+        menu.classList.add('open');
+      }
     });
     for (const rangeButton of rangeButtons) {
       rangeButton.addEventListener('click', () => {
@@ -1287,28 +1593,93 @@
     toolDetailsInput.addEventListener('change', () => {
       setIncludeToolDetails(toolDetailsInput.checked);
     });
-    for (const languageButton of languageButtons) {
-      languageButton.addEventListener('click', () => setLocale(languageButton.dataset.locale));
+    imagesInput.checked = exportSettings.includeImages;
+    imagesInput.addEventListener('change', () => {
+      setIncludeImages(imagesInput.checked);
+    });
+    function closeLanguagePicker({ focusTrigger = false } = {}) {
+      languagePicker.classList.remove('open');
+      languageTrigger.setAttribute('aria-expanded', 'false');
+      if (focusTrigger) languageTrigger.focus();
     }
+    function openLanguagePicker({ focusSelected = false } = {}) {
+      languagePicker.classList.add('open');
+      languageTrigger.setAttribute('aria-expanded', 'true');
+      if (focusSelected) {
+        const selected = languageOptions.find((option) => option.dataset.locale === currentLocale) || languageOptions[0];
+        selected?.focus();
+      }
+    }
+    async function chooseLanguage(option) {
+      if (!option?.dataset?.locale) return;
+      await setLocale(option.dataset.locale);
+      closeLanguagePicker({ focusTrigger: true });
+    }
+    languageTrigger.addEventListener('click', () => {
+      if (languagePicker.classList.contains('open')) closeLanguagePicker();
+      else openLanguagePicker();
+    });
+    languageTrigger.addEventListener('keydown', (event) => {
+      if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return;
+      event.preventDefault();
+      openLanguagePicker({ focusSelected: true });
+    });
+    languageList.addEventListener('click', (event) => {
+      const option = event.target.closest('[role="option"]');
+      if (option) chooseLanguage(option);
+    });
+    languageList.addEventListener('keydown', (event) => {
+      const currentOption = event.target.closest('[role="option"]');
+      if (!currentOption) return;
+      const currentIndex = languageOptions.indexOf(currentOption);
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        closeLanguagePicker({ focusTrigger: true });
+        return;
+      }
+      if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault();
+        chooseLanguage(currentOption);
+        return;
+      }
+      if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return;
+      event.preventDefault();
+      const delta = event.key === 'ArrowDown' ? 1 : -1;
+      const next = ns.languageSelector?.nextIndex?.(currentIndex, delta, languageOptions.length) ?? currentIndex;
+      languageOptions[next]?.focus();
+    });
     menu.addEventListener('click', (event) => {
       const target = event.target.closest('[data-format]');
       if (!target) return;
+      const format = target.dataset.format;
+      if (format === 'pdf' && !window.confirm(tr('pdf.confirm'))) return;
       menu.classList.remove('open');
-      exportConversation(target.dataset.format, { ...exportRangeSelection });
+      closeLanguagePicker();
+      if (format === 'pdf') {
+        exportConversation('pdf', { ...exportRangeSelection });
+      } else {
+        exportConversation(format, { ...exportRangeSelection });
+      }
     });
     pickerClose.addEventListener('click', () => closePartialPicker({ reopenMenu: true }));
     pickerBackdrop.addEventListener('click', (event) => {
       if (event.target === pickerBackdrop) closePartialPicker({ reopenMenu: true });
     });
+    shadow.addEventListener('click', (event) => {
+      if (!event.target.closest('.language-picker')) closeLanguagePicker();
+    });
     document.addEventListener('click', (event) => {
-      if (!host.contains(event.target)) menu.classList.remove('open');
+      if (!host.contains(event.target)) {
+        menu.classList.remove('open');
+        closeLanguagePicker();
+      }
     }, true);
 
     ui = {
       host, shadow, button, menu, progress, toast, toastTimer: null,
-      rangeButtons, rangeSummary, pickerBackdrop, pickerStatus, pickerList, pickerClose,
+      rangeButtons, rangeSummary, pickerBackdrop, pickerPanel, pickerSpinner, pickerStatus, pickerList, pickerClose,
       rangeTitle, optionsTitle, toolDetailsInput, toolDetailsLabel, toolDetailsHint,
-      languageTitle, languageButtons, menuHint, formatZip, formatMd, formatJson, pickerTitle,
+      imagesInput, imagesLabel, imagesHint, languageTitle, languagePicker, languageTrigger, languageCurrent, languageList, languageOptions, menuHint, formatZip, formatMd, formatPdf, formatJson, pickerTitle, pickerStart, pickerEnd, pickerConfirm,
     };
     applyUiLanguage();
     return ui;
