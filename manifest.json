@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "ChatGPT Conversation Exporter",
-  "version": "1.5.1",
-  "description": "一键导出当前 ChatGPT 对话，支持全量/部分导出、Markdown 图片资源包、PDF 打印导出、工具调用详情开关与多语言界面。",
+  "version": "1.6.0",
+  "description": "一键导出当前 ChatGPT 对话，支持全量/部分导出、图片资源、PDF、回复模型与推理信息、模型检测器、工具调用详情与多语言界面。",
   "permissions": [
     "activeTab",
     "scripting",
@@ -45,6 +45,7 @@
         "src/export-options.js",
         "src/i18n.js",
         "src/citation-resolver.js",
+        "src/model-metadata.js",
         "src/remote.js",
         "src/traversal.js",
         "src/assets.js",

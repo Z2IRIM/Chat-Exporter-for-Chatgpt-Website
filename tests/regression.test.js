@@ -661,7 +661,7 @@ test('large raster compression downsizes the longest edge, emits WebP, and keeps
 
 test('V1.5 UI keeps the persisted conversation-image option and packages image assets for Markdown/ZIP', () => {
   const manifest = JSON.parse(fs.readFileSync(path.join(ROOT, 'manifest.json'), 'utf8'));
-  assert.equal(manifest.version, '1.5.1');
+  assert.equal(manifest.version, '1.6.0');
 
   const content = fs.readFileSync(path.join(ROOT, 'src/content.js'), 'utf8');
   assert.match(content, /includeImages/);
@@ -779,7 +779,7 @@ test('print renderer creates a self-contained printable document with embedded i
 
 test('V1.5.1 PDF export keeps explicit pre-print confirmation', () => {
   const manifest = JSON.parse(fs.readFileSync(path.join(ROOT, 'manifest.json'), 'utf8'));
-  assert.equal(manifest.version, '1.5.1');
+  assert.equal(manifest.version, '1.6.0');
   const scripts = manifest.content_scripts?.[0]?.js || [];
   assert.ok(scripts.includes('src/print.js'));
   assert.ok(scripts.indexOf('src/print.js') < scripts.indexOf('src/content.js'));
@@ -1014,4 +1014,132 @@ test('V1.5.1 refresh control is localized across every supported UI locale', () 
     assert.notEqual(refresh, 'picker.refresh');
     assert.ok(refresh.trim().length > 0);
   }
+});
+
+test('V1.6 model metadata helper keeps original field names and omits them when export is disabled', () => {
+  const ns = loadNamespaceScript('src/model-metadata.js');
+  assert.equal(typeof ns.modelMetadata?.toExportFields, 'function', 'modelMetadata.toExportFields must exist');
+
+  const message = {
+    role: 'assistant',
+    model_slug: 'gpt-5.6',
+    resolved_model_slug: 'gpt-5.6-sol',
+    thinking_effort: 'high',
+  };
+  assert.equal(JSON.stringify(ns.modelMetadata.toExportFields(message, false)), '{}');
+  assert.equal(JSON.stringify(ns.modelMetadata.toExportFields(message, true)), JSON.stringify({
+    model_slug: 'gpt-5.6',
+    resolved_model_slug: 'gpt-5.6-sol',
+    thinking_effort: 'high',
+  }));
+});
+
+test('V1.6 assistant normalization merges the last non-empty model metadata across one logical reply', () => {
+  const ns = loadNamespaceScript('src/model-metadata.js');
+  const remoteNs = loadNamespaceScript('src/remote.js', { ChatGPTConversationExporter: ns });
+  const remote = remoteNs.remote || ns.remote;
+  assert.equal(typeof remote?.normalizeConversation, 'function');
+
+  const data = {
+    current_node: 'a2',
+    mapping: {
+      u1: { parent: null, message: { id: 'u1', author: { role: 'user' }, content: { content_type: 'text', parts: ['Q'] }, metadata: {} } },
+      a1: {
+        parent: 'u1',
+        message: {
+          id: 'a1', author: { role: 'assistant' }, recipient: 'all',
+          content: { content_type: 'text', parts: ['first part'] },
+          metadata: { model_slug: 'gpt-5.6', resolved_model_slug: 'gpt-5.6-luna', thinking_effort: 'medium' },
+        },
+      },
+      a2: {
+        parent: 'a1',
+        message: {
+          id: 'a2', author: { role: 'assistant' }, recipient: 'all',
+          content: { content_type: 'text', parts: ['second part'] },
+          metadata: { resolved_model_slug: 'gpt-5.6-sol', thinking_effort: 'high' },
+        },
+      },
+    },
+  };
+
+  const result = remote.normalizeConversation(data, 'conversation-1');
+  const assistant = result.messages.find((message) => message.role === 'assistant');
+  assert.equal(assistant.model_slug, 'gpt-5.6');
+  assert.equal(assistant.resolved_model_slug, 'gpt-5.6-sol');
+  assert.equal(assistant.thinking_effort, 'high');
+});
+
+test('V1.6 latest model detector reads only the latest assistant reply and does not fall back to older replies', () => {
+  const ns = loadNamespaceScript('src/model-metadata.js');
+  assert.equal(typeof ns.modelMetadata?.getLatestAssistantInfo, 'function');
+
+  const messages = [
+    { role: 'assistant', resolved_model_slug: 'gpt-5.6-sol', thinking_effort: 'high' },
+    { role: 'user', text: 'next' },
+    { role: 'assistant', resolved_model_slug: null, thinking_effort: null },
+  ];
+  const latest = ns.modelMetadata.getLatestAssistantInfo(messages);
+  assert.equal(latest.resolved_model_slug, null);
+  assert.equal(latest.thinking_effort, null);
+});
+
+test('V1.6 export option defaults model metadata export off and preserves explicit enable', () => {
+  const ns = loadNamespaceScript('src/export-options.js');
+  assert.equal(ns.exportOptions.normalize().includeModelMetadata, false);
+  assert.equal(ns.exportOptions.normalize({ includeModelMetadata: true }).includeModelMetadata, true);
+});
+
+test('V1.6 printable PDF can render assistant model metadata only when enabled', () => {
+  const ns = loadNamespaceScript('src/print.js');
+  const message = {
+    role: 'assistant', markdown: 'Answer', images: [], attachments: [],
+    model_slug: 'gpt-5.6', resolved_model_slug: 'gpt-5.6-sol', thinking_effort: 'high',
+  };
+  const labels = { selectedModel: 'Selected model', resolvedModel: 'Resolved model', thinkingEffort: 'Thinking effort' };
+  const enabled = ns.print.buildPrintHtml({ messages: [message], includeModelMetadata: true, modelLabels: labels });
+  assert.match(enabled, /Selected model/);
+  assert.match(enabled, /gpt-5\.6-sol/);
+  assert.match(enabled, /Thinking effort/);
+  assert.match(enabled, /high/);
+
+  const disabled = ns.print.buildPrintHtml({ messages: [message], includeModelMetadata: false, modelLabels: labels });
+  assert.doesNotMatch(disabled, /Selected model/);
+  assert.doesNotMatch(disabled, /gpt-5\.6-sol/);
+});
+
+test('V1.6 UI includes model metadata export switch, conversation model detector, and moves the floating control 20px left', () => {
+  const content = fs.readFileSync(path.join(ROOT, 'src/content.js'), 'utf8');
+  assert.match(content, /model-metadata-input/);
+  assert.match(content, /model-detector/);
+  assert.match(content, /resolved-model-value/);
+  assert.match(content, /thinking-effort-value/);
+  assert.match(content, /right:\s*38px/);
+  assert.match(content, /refreshModelDetector/);
+});
+
+test('V1.6 model metadata UI strings exist for all supported locales', () => {
+  const ns = loadNamespaceScript('src/i18n.js');
+  const keys = [
+    'menu.modelMetadata', 'menu.modelMetadataHint', 'modelDetector.title', 'modelDetector.resolvedModel',
+    'modelDetector.thinkingEffort', 'modelDetector.loading', 'modelDetector.unavailable',
+    'md.modelMetadata', 'md.selectedModel', 'md.resolvedModel', 'md.thinkingEffort',
+  ];
+  for (const locale of ns.i18n.SUPPORTED_LOCALES) {
+    for (const key of keys) assert.notEqual(ns.i18n.t(locale, key), key, `${locale} must provide ${key}`);
+  }
+});
+
+test('V1.6 packages model metadata before remote/content, upgrades schema to 9, and sets version 1.6.0', () => {
+  const manifest = JSON.parse(fs.readFileSync(path.join(ROOT, 'manifest.json'), 'utf8'));
+  assert.equal(manifest.version, '1.6.0');
+  const scripts = manifest.content_scripts?.[0]?.js || [];
+  assert.ok(scripts.includes('src/model-metadata.js'));
+  assert.ok(scripts.indexOf('src/model-metadata.js') < scripts.indexOf('src/remote.js'));
+  assert.ok(scripts.indexOf('src/model-metadata.js') < scripts.indexOf('src/content.js'));
+
+  const background = fs.readFileSync(path.join(ROOT, 'src/background.js'), 'utf8');
+  assert.match(background, /src\/model-metadata\.js/);
+  const content = fs.readFileSync(path.join(ROOT, 'src/content.js'), 'utf8');
+  assert.match(content, /schemaVersion:\s*9/);
 });

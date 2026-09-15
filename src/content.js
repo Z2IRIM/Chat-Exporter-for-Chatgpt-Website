@@ -24,10 +24,12 @@
   let exportInProgress = false;
   let firstSeenSequence = 0;
   let exportRangeSelection = { mode: 'full', startMessageKey: null, startLabel: null, endMessageKey: null, endLabel: null, url: null };
-  let exportSettings = ns.exportOptions?.normalize?.() || { includeToolDetails: false, includeImages: true };
+  let exportSettings = ns.exportOptions?.normalize?.() || { includeToolDetails: false, includeImages: true, includeModelMetadata: false };
   let currentLocale = ns.i18n?.DEFAULT_LOCALE || 'zh-CN';
   let partialScanCache = null;
   let partialPickerLoading = false;
+  let modelDetectorLoading = false;
+  let modelDetectorInfo = { state: 'idle', resolved_model_slug: null, thinking_effort: null };
 
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -805,7 +807,7 @@
     const assistantCount = messages.filter((item) => item.role === 'assistant').length;
 
     const metadata = {
-      schemaVersion: 8,
+      schemaVersion: 9,
       source: 'ChatGPT',
       title,
       conversationId: scanInfo?.remoteContext?.conversationId || getConversationId(),
@@ -828,6 +830,7 @@
       exportedMessageCount: rangeMetadata?.exportedMessageCount ?? messages.length,
       includeToolDetails: options?.includeToolDetails === true,
       includeImages: options?.includeImages !== false,
+      includeModelMetadata: options?.includeModelMetadata === true,
       uiLocale: currentLocale,
     };
 
@@ -853,6 +856,7 @@
       `- ${tr('md.range')}${separator}${rangeLabel}`,
       `- ${tr('md.imageArchive')}${separator}${imageLabel}`,
       `- ${tr('md.toolDetails')}${separator}${metadata.includeToolDetails ? tr('md.included') : tr('md.excluded')}`,
+      `- ${tr('md.modelMetadata')}${separator}${metadata.includeModelMetadata ? tr('md.included') : tr('md.excluded')}`,
       `- ${tr('md.branch')}${separator}${tr('md.currentBranch')}`,
       '',
       '---',
@@ -861,6 +865,13 @@
 
     messages.forEach((message, position) => {
       markdownParts.push(`## ${message.role === 'user' ? 'User' : 'Assistant'}`, '');
+      if (metadata.includeModelMetadata && message.role === 'assistant') {
+        const modelValue = (value) => String(value || '—').replace(/`/g, '\`');
+        markdownParts.push(
+          `> **${tr('md.modelMetadata')}** · ${tr('md.selectedModel')}: \`${modelValue(message.model_slug)}\` · ${tr('md.resolvedModel')}: \`${modelValue(message.resolved_model_slug)}\` · ${tr('md.thinkingEffort')}: \`${modelValue(message.thinking_effort)}\``,
+          '',
+        );
+      }
       const renderedMarkdown = ns.assets?.renderMarkdownImages
         ? ns.assets.renderMarkdownImages(message.markdown, message.images, resolvedImageSources, metadata.includeImages)
         : message.markdown;
@@ -881,9 +892,10 @@
 
     const json = {
       ...metadata,
-      messages: messages.map(({ key, firstSeen, ...message }, position) => ({
+      messages: messages.map(({ key, firstSeen, model_slug, resolved_model_slug, thinking_effort, ...message }, position) => ({
         position: position + 1,
         ...message,
+        ...(ns.modelMetadata?.toExportFields?.({ role: message.role, model_slug, resolved_model_slug, thinking_effort }, metadata.includeModelMetadata) || {}),
       })),
     };
 
@@ -1046,6 +1058,12 @@
           messages,
           imageDataBySource,
           includeImages: exportSettings.includeImages,
+          includeModelMetadata: exportSettings.includeModelMetadata,
+          modelLabels: {
+            selectedModel: tr('md.selectedModel'),
+            resolvedModel: tr('md.resolvedModel'),
+            thinkingEffort: tr('md.thinkingEffort'),
+          },
         });
         await printDocument(html);
       } else {
@@ -1320,6 +1338,45 @@
     }
   }
 
+  /** Render the latest Assistant model detector from local detector state. */
+  function renderModelDetector() {
+    if (!ui) return;
+    ui.modelDetectorTitle.textContent = tr('modelDetector.title');
+    ui.resolvedModelLabel.textContent = tr('modelDetector.resolvedModel');
+    ui.thinkingEffortLabel.textContent = tr('modelDetector.thinkingEffort');
+    const loading = modelDetectorInfo.state === 'loading';
+    const unavailable = modelDetectorInfo.state === 'error' || modelDetectorInfo.state === 'idle';
+    ui.resolvedModelValue.textContent = loading
+      ? tr('modelDetector.loading')
+      : (modelDetectorInfo.resolved_model_slug || (unavailable ? tr('modelDetector.unavailable') : '—'));
+    ui.thinkingEffortValue.textContent = loading
+      ? tr('modelDetector.loading')
+      : (modelDetectorInfo.thinking_effort || (unavailable ? tr('modelDetector.unavailable') : '—'));
+  }
+
+  /** Refresh the model detector from the complete current conversation and warm the range cache. */
+  async function refreshModelDetector() {
+    if (modelDetectorLoading) return;
+    const current = ensureUi();
+    modelDetectorLoading = true;
+    modelDetectorInfo = { state: 'loading', resolved_model_slug: null, thinking_effort: null };
+    renderModelDetector();
+    try {
+      const scanInfo = await scanConversation(null, exportSettings);
+      if (scanInfo?.messages?.length) {
+        partialScanCache = { url: location.href, includeToolDetails: exportSettings.includeToolDetails, scanInfo };
+      }
+      const latest = ns.modelMetadata?.getLatestAssistantInfo?.(scanInfo?.messages || []) || { resolved_model_slug: null, thinking_effort: null };
+      modelDetectorInfo = { state: 'ready', ...latest };
+    } catch (error) {
+      console.warn('[ChatGPT Conversation Exporter] Model detector unavailable.', error);
+      modelDetectorInfo = { state: 'error', resolved_model_slug: null, thinking_effort: null };
+    } finally {
+      modelDetectorLoading = false;
+      if (current === ui) renderModelDetector();
+    }
+  }
+
   /**
    * Re-render fixed UI labels after a locale change without rebuilding the Shadow DOM.
    */
@@ -1332,6 +1389,8 @@
     ui.optionsTitle.textContent = tr('menu.optionsTitle');
     ui.toolDetailsLabel.textContent = tr('menu.toolDetails');
     ui.toolDetailsHint.textContent = tr('menu.toolDetailsHint');
+    ui.modelMetadataLabel.textContent = tr('menu.modelMetadata');
+    ui.modelMetadataHint.textContent = tr('menu.modelMetadataHint');
     ui.imagesLabel.textContent = tr('menu.images');
     ui.imagesHint.textContent = tr('menu.imagesHint');
     ui.languageTitle.textContent = tr('menu.languageTitle');
@@ -1349,6 +1408,7 @@
     ui.pickerClose.setAttribute('aria-label', tr('picker.close'));
     ui.pickerBackdrop.querySelector('.picker')?.setAttribute('aria-label', tr('picker.title'));
     updateLanguagePickerUi();
+    renderModelDetector();
     updateRangeUi();
   }
 
@@ -1356,9 +1416,20 @@
    * Persist the tool-detail option and invalidate cached normalized API messages.
    */
   async function setIncludeToolDetails(enabled) {
-    exportSettings = ns.exportOptions?.normalize?.({ ...exportSettings, includeToolDetails: enabled }) || { includeToolDetails: enabled === true, includeImages: exportSettings.includeImages !== false };
+    exportSettings = ns.exportOptions?.normalize?.({ ...exportSettings, includeToolDetails: enabled }) || { includeToolDetails: enabled === true, includeImages: exportSettings.includeImages !== false, includeModelMetadata: exportSettings.includeModelMetadata === true };
     partialScanCache = null;
     if (ui) ui.toolDetailsInput.checked = exportSettings.includeToolDetails;
+    await ns.exportOptions?.save?.(exportSettings);
+  }
+
+  /** Persist whether Assistant model/reasoning metadata should be written into export files. */
+  async function setIncludeModelMetadata(enabled) {
+    exportSettings = ns.exportOptions?.normalize?.({ ...exportSettings, includeModelMetadata: enabled }) || {
+      includeToolDetails: exportSettings.includeToolDetails === true,
+      includeImages: exportSettings.includeImages !== false,
+      includeModelMetadata: enabled === true,
+    };
+    if (ui) ui.modelMetadataInput.checked = exportSettings.includeModelMetadata;
     await ns.exportOptions?.save?.(exportSettings);
   }
 
@@ -1369,6 +1440,7 @@
     exportSettings = ns.exportOptions?.normalize?.({ ...exportSettings, includeImages: enabled }) || {
       includeToolDetails: exportSettings.includeToolDetails === true,
       includeImages: enabled !== false,
+      includeModelMetadata: exportSettings.includeModelMetadata === true,
     };
     if (ui) ui.imagesInput.checked = exportSettings.includeImages;
     await ns.exportOptions?.save?.(exportSettings);
@@ -1408,6 +1480,7 @@
     if (ui) {
       ui.toolDetailsInput.checked = exportSettings.includeToolDetails;
       ui.imagesInput.checked = exportSettings.includeImages;
+      ui.modelMetadataInput.checked = exportSettings.includeModelMetadata;
       updateLanguagePickerUi();
     }
     applyUiLanguage();
@@ -1428,7 +1501,7 @@
     shadow.innerHTML = `
       <style>
         :host { all: initial; }
-        .wrap { position: fixed; right: 18px; bottom: 86px; z-index: 2147483646; font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+        .wrap { position: fixed; right: 38px; bottom: 86px; z-index: 2147483646; font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
         .button { border: 1px solid rgba(127,127,127,.32); background: rgba(30,30,30,.92); color: #fff; border-radius: 999px; padding: 9px 13px; font-size: 13px; font-weight: 650; line-height: 1; cursor: pointer; box-shadow: 0 8px 26px rgba(0,0,0,.22); backdrop-filter: blur(12px); }
         .button:hover { transform: translateY(-1px); }
         .button:disabled { opacity: .55; cursor: progress; transform: none; }
@@ -1442,6 +1515,10 @@
         .range-option:hover { background: rgba(255,255,255,.07); }
         .range-option.active { background: rgba(255,255,255,.14); border-color: rgba(255,255,255,.28); color: #fff; }
         .range-summary { min-height: 28px; color: rgba(255,255,255,.58); font-size: 11px; line-height: 1.4; padding: 2px 4px 5px; overflow-wrap: anywhere; }
+        .model-detector { display: grid; gap: 5px; padding: 8px 9px; border-radius: 10px; border: 1px solid rgba(255,255,255,.10); background: rgba(255,255,255,.045); }
+        .model-detector-row { display: grid; grid-template-columns: 82px minmax(0,1fr); gap: 8px; align-items: baseline; font-size: 11px; line-height: 1.35; }
+        .model-detector-label { color: rgba(255,255,255,.48); }
+        .model-detector-value { min-width: 0; color: rgba(255,255,255,.9); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; overflow-wrap: anywhere; text-align: left; }
         .option-row { display: flex; align-items: flex-start; gap: 8px; padding: 7px 5px; border-radius: 9px; }
         .option-row:hover { background: rgba(255,255,255,.05); }
         .option-row input { margin: 2px 0 0; accent-color: #fff; }
@@ -1521,12 +1598,25 @@
           </div>
           <div class="range-summary">导出当前分支的全部对话内容</div>
           <div class="divider"></div>
+          <div class="section-title model-detector-title">对话模型检测器</div>
+          <div class="model-detector" aria-live="polite">
+            <div class="model-detector-row"><span class="model-detector-label resolved-model-label">命中模型</span><span class="model-detector-value resolved-model-value">—</span></div>
+            <div class="model-detector-row"><span class="model-detector-label thinking-effort-label">推理强度</span><span class="model-detector-value thinking-effort-value">—</span></div>
+          </div>
+          <div class="divider"></div>
           <div class="section-title options-title">导出选项</div>
           <label class="option-row">
             <input class="tool-details-input" type="checkbox">
             <span class="option-copy">
               <span class="option-label tool-details-label">包含 GPT 工具调用详情</span>
               <span class="option-hint tool-details-hint">关闭后不导出工具调用参数与工具文本结果</span>
+            </span>
+          </label>
+          <label class="option-row">
+            <input class="model-metadata-input" type="checkbox">
+            <span class="option-copy">
+              <span class="option-label model-metadata-label">包含回复模型与推理信息</span>
+              <span class="option-hint model-metadata-hint">开启后导出每条 Assistant 回复的选择模型、命中模型和推理强度</span>
             </span>
           </label>
           <label class="option-row">
@@ -1596,10 +1686,18 @@
     const pickerRefresh = shadow.querySelector('.picker-refresh');
     const pickerClose = shadow.querySelector('.picker-close');
     const rangeTitle = shadow.querySelector('.range-title');
+    const modelDetectorTitle = shadow.querySelector('.model-detector-title');
+    const resolvedModelLabel = shadow.querySelector('.resolved-model-label');
+    const resolvedModelValue = shadow.querySelector('.resolved-model-value');
+    const thinkingEffortLabel = shadow.querySelector('.thinking-effort-label');
+    const thinkingEffortValue = shadow.querySelector('.thinking-effort-value');
     const optionsTitle = shadow.querySelector('.options-title');
     const toolDetailsInput = shadow.querySelector('.tool-details-input');
     const toolDetailsLabel = shadow.querySelector('.tool-details-label');
     const toolDetailsHint = shadow.querySelector('.tool-details-hint');
+    const modelMetadataInput = shadow.querySelector('.model-metadata-input');
+    const modelMetadataLabel = shadow.querySelector('.model-metadata-label');
+    const modelMetadataHint = shadow.querySelector('.model-metadata-hint');
     const imagesInput = shadow.querySelector('.images-input');
     const imagesLabel = shadow.querySelector('.images-label');
     const imagesHint = shadow.querySelector('.images-hint');
@@ -1627,6 +1725,7 @@
         languageTrigger.setAttribute('aria-expanded', 'false');
       } else {
         menu.classList.add('open');
+        refreshModelDetector();
       }
     });
     for (const rangeButton of rangeButtons) {
@@ -1641,6 +1740,10 @@
     toolDetailsInput.checked = exportSettings.includeToolDetails;
     toolDetailsInput.addEventListener('change', () => {
       setIncludeToolDetails(toolDetailsInput.checked);
+    });
+    modelMetadataInput.checked = exportSettings.includeModelMetadata;
+    modelMetadataInput.addEventListener('change', () => {
+      setIncludeModelMetadata(modelMetadataInput.checked);
     });
     imagesInput.checked = exportSettings.includeImages;
     imagesInput.addEventListener('change', () => {
@@ -1727,7 +1830,8 @@
     ui = {
       host, shadow, button, menu, progress, toast, toastTimer: null,
       rangeButtons, rangeSummary, pickerBackdrop, pickerPanel, pickerSpinner, pickerStatus, pickerList, pickerRefresh, pickerClose,
-      rangeTitle, optionsTitle, toolDetailsInput, toolDetailsLabel, toolDetailsHint,
+      rangeTitle, modelDetectorTitle, resolvedModelLabel, resolvedModelValue, thinkingEffortLabel, thinkingEffortValue,
+      optionsTitle, toolDetailsInput, toolDetailsLabel, toolDetailsHint, modelMetadataInput, modelMetadataLabel, modelMetadataHint,
       imagesInput, imagesLabel, imagesHint, languageTitle, languagePicker, languageTrigger, languageCurrent, languageList, languageOptions, menuHint, formatZip, formatMd, formatPdf, formatJson, pickerTitle, pickerStart, pickerEnd, pickerConfirm,
     };
     applyUiLanguage();
@@ -1760,7 +1864,10 @@
   chrome.runtime?.onMessage?.addListener((message, _sender, sendResponse) => {
     if (message?.type === 'CGPT_EXPORT_OPEN_MENU') {
       const current = ensureUi();
-      if (!exportInProgress) current.menu.classList.add('open');
+      if (!exportInProgress) {
+        current.menu.classList.add('open');
+        refreshModelDetector();
+      }
       sendResponse({ ok: !exportInProgress });
       return false;
     }

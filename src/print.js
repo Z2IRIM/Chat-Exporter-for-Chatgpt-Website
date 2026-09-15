@@ -36,7 +36,7 @@
   }
 
   /** Build a self-contained HTML document for the browser print engine. */
-  function buildPrintHtml({ title = 'ChatGPT Conversation', messages = [], imageDataBySource = new Map(), includeImages = true } = {}) {
+  function buildPrintHtml({ title = 'ChatGPT Conversation', messages = [], imageDataBySource = new Map(), includeImages = true, includeModelMetadata = false, modelLabels = {} } = {}) {
     const sources = typeof imageDataBySource?.get === 'function'
       ? imageDataBySource
       : new Map(Object.entries(imageDataBySource || {}));
@@ -54,7 +54,10 @@
       const attachments = (message?.attachments || []).length
         ? `<div class="attachments">${(message.attachments || []).map((item) => `<div>📎 ${escapeHtml(item?.name || 'attachment')}</div>`).join('')}</div>`
         : '';
-      return `<section class="message ${role.toLowerCase()}"><h2>${role}</h2><div class="message-body">${body}</div>${images}${attachments}</section>`;
+      const modelMetadata = includeModelMetadata && role === 'Assistant'
+        ? `<div class="model-meta"><span>${escapeHtml(modelLabels.selectedModel || 'Selected model')}: ${escapeHtml(message?.model_slug || '—')}</span><span>${escapeHtml(modelLabels.resolvedModel || 'Resolved model')}: ${escapeHtml(message?.resolved_model_slug || '—')}</span><span>${escapeHtml(modelLabels.thinkingEffort || 'Thinking effort')}: ${escapeHtml(message?.thinking_effort || '—')}</span></div>`
+        : '';
+      return `<section class="message ${role.toLowerCase()}"><h2>${role}</h2>${modelMetadata}<div class="message-body">${body}</div>${images}${attachments}</section>`;
     }).join('\n');
 
     return `<!doctype html>
@@ -71,7 +74,8 @@
   h1 { margin: 0 0 24px; font-size: 24px; line-height: 1.25; }
   .message { padding: 16px 0 20px; border-top: 1px solid #ddd; }
   .message:first-of-type { border-top: 0; }
-  .message > h2 { margin: 0 0 9px; font-size: 14px; line-height: 1.3; }
+  .message > h2 { margin: 0 0 7px; font-size: 14px; line-height: 1.3; }
+  .model-meta { display: flex; flex-wrap: wrap; gap: 5px 12px; margin: 0 0 10px; color: #666; font-size: 9.5pt; line-height: 1.4; }
   .message-body { overflow-wrap: anywhere; }
   .message-body > :first-child { margin-top: 0; }
   .message-body > :last-child { margin-bottom: 0; }

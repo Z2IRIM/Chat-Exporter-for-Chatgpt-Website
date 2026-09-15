@@ -86,7 +86,7 @@ chrome.action.onClicked.addListener(async (tab) => {
     try {
       await chrome.scripting.executeScript({
         target: { tabId: tab.id },
-        files: ['src/i18n.js', 'src/export-options.js', 'src/citation-resolver.js', 'src/remote.js', 'src/traversal.js', 'src/assets.js', 'src/range.js', 'src/zip.js', 'src/markdown-renderer.js', 'src/print.js', 'src/language-selector.js', 'src/content.js'],
+        files: ['src/i18n.js', 'src/export-options.js', 'src/model-metadata.js', 'src/citation-resolver.js', 'src/remote.js', 'src/traversal.js', 'src/assets.js', 'src/range.js', 'src/zip.js', 'src/markdown-renderer.js', 'src/print.js', 'src/language-selector.js', 'src/content.js'],
       });
       await sendOpenMenu(tab.id);
     } catch (error) {

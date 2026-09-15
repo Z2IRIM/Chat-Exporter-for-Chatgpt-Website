@@ -194,7 +194,21 @@
       attachments: [],
       images: [],
       sourceMessageIds: [],
+      model_slug: null,
+      resolved_model_slug: null,
+      thinking_effort: null,
     };
+  }
+
+  /** Preserve the last non-empty model metadata value seen within one logical Assistant reply. */
+  function mergeAssistantModelMetadata(target, metadata = {}) {
+    const fields = ['model_slug', 'resolved_model_slug', 'thinking_effort'];
+    for (const field of fields) {
+      const value = metadata?.[field];
+      if (value === null || value === undefined) continue;
+      const text = String(value).trim();
+      if (text) target[field] = text;
+    }
   }
 
   /**
@@ -240,6 +254,9 @@
           attachments: pendingAssistant.attachments,
           images: pendingAssistant.images,
           sourceMessageIds: pendingAssistant.sourceMessageIds,
+          model_slug: pendingAssistant.model_slug,
+          resolved_model_slug: pendingAssistant.resolved_model_slug,
+          thinking_effort: pendingAssistant.thinking_effort,
         });
       }
       pendingAssistant = null;
@@ -272,6 +289,7 @@
 
       if (role === 'assistant') {
         const pending = ensureAssistant(message);
+        mergeAssistantModelMetadata(pending, message?.metadata || {});
         if (message.id) pending.sourceMessageIds.push(message.id);
         mergeUniqueAttachments(pending.attachments, parsed.attachments);
 
@@ -297,6 +315,7 @@
 
       if (role === 'tool') {
         const pending = ensureAssistant(message);
+        mergeAssistantModelMetadata(pending, message?.metadata || {});
         if (message.id) pending.sourceMessageIds.push(message.id);
         mergeUniqueAttachments(pending.attachments, parsed.attachments);
         if (includeToolDetails) {

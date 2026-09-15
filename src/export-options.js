@@ -5,7 +5,7 @@
   if (ns.exportOptions) return;
 
   const STORAGE_KEY = 'chatgptConversationExporter.options';
-  const DEFAULTS = Object.freeze({ includeToolDetails: false, includeImages: true });
+  const DEFAULTS = Object.freeze({ includeToolDetails: false, includeImages: true, includeModelMetadata: false });
 
   /**
    * Normalize persisted or caller-provided export options to the supported contract.
@@ -14,6 +14,7 @@
     return {
       includeToolDetails: value?.includeToolDetails === true,
       includeImages: value?.includeImages !== false,
+      includeModelMetadata: value?.includeModelMetadata === true,
     };
   }
 
